@@ -10,6 +10,7 @@ cpal-example = ["cpal"]
 [dependencies]
 
 cpal = { version = "0.15", optional = true }
+hound = "3.5"
 
 [[example]]
 name = "cpal_aec"

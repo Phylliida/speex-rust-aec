@@ -26,9 +26,9 @@ use std::{
     collections::VecDeque,
     env,
     error::Error,
-    f32::consts::PI,
     ffi::c_void,
     mem,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -37,6 +37,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, SampleFormat, Stream, StreamConfig,
 };
+use hound::{self, WavSpec};
 use speex_rust_aec::{
     speex_echo_cancellation, speex_echo_ctl, EchoCanceller, Resampler, SPEEX_ECHO_SET_SAMPLING_RATE,
 };
@@ -52,6 +53,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .get(2)
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(DEFAULT_AEC_RATE);
+
+    let far_audio_path = args
+        .get(3)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("examples/far_end.wav"));
 
     let input_device = if let Some(name) = args.get(0) {
         select_device(host.input_devices(), name, "Input")?
@@ -88,6 +94,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "Input rate: {input_rate} Hz, output rate: {output_rate} Hz, AEC rate: {target_sample_rate} Hz"
     );
+
+    let far_audio = load_far_audio(&far_audio_path, channels, output_rate)
+        .map_err(|e| format!("Failed to load far-end audio '{}': {e}", far_audio_path.display()))?;
+    println!("Far-end audio source: {}", far_audio_path.display());
+    let far_source = Arc::new(Mutex::new(far_audio));
 
     let mut mic_resampler = if input_rate != target_sample_rate {
         println!("Resampling input stream to match AEC rate.");
@@ -155,12 +166,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         far_resampler,
     )));
 
-    let phase_increment = 440.0f32 * 2.0 * PI / output_rate as f32;
     let output_stream = build_output_stream(
         &output_device,
         &output_stream_config,
         Arc::clone(&shared),
-        phase_increment,
+        Arc::clone(&far_source),
         channels,
         output_config.sample_format(),
     )?;
@@ -179,7 +189,35 @@ fn main() -> Result<(), Box<dyn Error>> {
     std::thread::sleep(Duration::from_secs(5));
     println!("Done.");
 
-    // Streams stop and the Speex state is dropped when leaving scope.
+    drop(output_stream);
+    drop(input_stream);
+
+    let recording_path = PathBuf::from("examples/aec_output.wav");
+    let recorded_samples = {
+        let mut guard = shared.lock().unwrap();
+        guard.take_recording()
+    };
+
+    if recorded_samples.is_empty() {
+        eprintln!("No echo-cancelled audio captured; skipping write to {}", recording_path.display());
+    } else {
+        let spec = WavSpec {
+            channels: channels as u16,
+            sample_rate: target_sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&recording_path, spec)?;
+        for sample in recorded_samples {
+            writer.write_sample(sample)?;
+        }
+        writer.finalize()?;
+        println!(
+            "Wrote echo-cancelled audio to {}",
+            recording_path.display()
+        );
+    }
+
     Ok(())
 }
 
@@ -199,6 +237,7 @@ struct SharedCanceller {
     far_frame: Vec<i16>,
     out_frame: Vec<i16>,
     processed_frames: usize,
+    recorded: Vec<i16>,
 }
 
 impl SharedCanceller {
@@ -226,6 +265,7 @@ impl SharedCanceller {
             far_frame: vec![0; frame_samples],
             out_frame: vec![0; frame_samples],
             processed_frames: 0,
+            recorded: Vec::with_capacity(frame_samples * 8),
         }
     }
 
@@ -275,6 +315,8 @@ impl SharedCanceller {
                 );
             }
             self.processed_frames += 1;
+            self.recorded
+                .extend(self.out_frame.iter().copied());
             if self.processed_frames % 50 == 0 {
                 let rms = (self
                     .out_frame
@@ -345,20 +387,237 @@ impl SharedCanceller {
         }
     }
 
+    fn take_recording(&mut self) -> Vec<i16> {
+        mem::take(&mut self.recorded)
+    }
+}
+
+struct FarAudioSource {
+    samples: Vec<i16>,
+    channels: usize,
+    position: usize,
+    resampler: Option<Resampler>,
+    pending: Vec<i16>,
+    scratch: Vec<i16>,
+    queue: VecDeque<i16>,
+}
+
+impl FarAudioSource {
+    fn new(
+        samples: Vec<i16>,
+        source_rate: u32,
+        output_rate: u32,
+        channels: usize,
+    ) -> Result<Self, String> {
+        if channels == 0 {
+            return Err("Output channel count must be greater than zero".into());
+        }
+        if samples.is_empty() {
+            return Err("Audio file contained no samples".into());
+        }
+
+        let resampler = if source_rate != output_rate {
+            let mut r = Resampler::new(
+                channels as u32,
+                source_rate,
+                output_rate,
+                RESAMPLER_QUALITY,
+            )
+            .map_err(|e| format!("Failed to create playback resampler: {e}"))?;
+            if let Err(err) = r.skip_zeros() {
+                eprintln!("Unable to prime playback resampler: {err}");
+            }
+            Some(r)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            samples,
+            channels,
+            position: 0,
+            resampler,
+            pending: Vec::with_capacity(channels * 1024),
+            scratch: Vec::with_capacity(channels * 1024),
+            queue: VecDeque::with_capacity(channels * 1024),
+        })
+    }
+
+    fn next_samples(&mut self, out: &mut [i16]) {
+        if out.is_empty() {
+            return;
+        }
+        if let Some(_) = self.resampler {
+            self.fill_resampled(out.len());
+            for sample in out.iter_mut() {
+                if let Some(value) = self.queue.pop_front() {
+                    *sample = value;
+                } else {
+                    *sample = 0;
+                }
+            }
+        } else {
+            let len = self.samples.len();
+            let mut pos = self.position;
+            for sample in out.iter_mut() {
+                *sample = self.samples[pos];
+                pos += 1;
+                if pos >= len {
+                    pos = 0;
+                }
+            }
+            self.position = pos;
+        }
+    }
+
+    fn fill_resampled(&mut self, required_samples: usize) {
+        let Some(resampler) = self.resampler.as_mut() else {
+            return;
+        };
+        if self.samples.is_empty() {
+            return;
+        }
+        let len = self.samples.len();
+        while self.queue.len() < required_samples {
+            let before = self.queue.len();
+            let chunk_frames = ((required_samples.saturating_sub(before)) / self.channels)
+                .max(1);
+            let chunk_samples = chunk_frames * self.channels;
+            self.pending.reserve(chunk_samples);
+            for _ in 0..chunk_samples {
+                self.pending.push(self.samples[self.position]);
+                self.position += 1;
+                if self.position >= len {
+                    self.position = 0;
+                }
+            }
+            SharedCanceller::queue_resampled(
+                resampler,
+                &mut self.pending,
+                &[],
+                &mut self.scratch,
+                &mut self.queue,
+            );
+            if self.queue.len() == before {
+                break;
+            }
+        }
+    }
+}
+
+fn load_far_audio(
+    path: &Path,
+    output_channels: usize,
+    output_rate: u32,
+) -> Result<FarAudioSource, Box<dyn Error>> {
+    if output_channels == 0 {
+        return Err("Output channel count must be greater than zero".into());
+    }
+
+    let mut reader = hound::WavReader::open(path)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let spec = reader.spec();
+
+    if spec.channels == 0 {
+        return Err("WAV file reports zero channels".into());
+    }
+
+    let source_channels = spec.channels as usize;
+    let mut frame = vec![0i16; source_channels];
+    let mut frame_index = 0usize;
+    let mut samples: Vec<i16> = Vec::new();
+
+    match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Int, 16) => {
+            for sample in reader.samples::<i16>() {
+                let sample = sample?;
+                frame[frame_index] = sample;
+                frame_index += 1;
+                if frame_index == source_channels {
+                    push_mapped_frame(
+                        &frame,
+                        source_channels,
+                        output_channels,
+                        &mut samples,
+                    );
+                    frame_index = 0;
+                }
+            }
+        }
+        (hound::SampleFormat::Float, 32) => {
+            for sample in reader.samples::<f32>() {
+                let sample = sample?;
+                let clamped = sample.clamp(-1.0, 1.0);
+                let as_i16 = (clamped * i16::MAX as f32) as i16;
+                frame[frame_index] = as_i16;
+                frame_index += 1;
+                if frame_index == source_channels {
+                    push_mapped_frame(
+                        &frame,
+                        source_channels,
+                        output_channels,
+                        &mut samples,
+                    );
+                    frame_index = 0;
+                }
+            }
+        }
+        (format, bits) => {
+            return Err(format!(
+                "Unsupported WAV format: {:?} at {} bits per sample",
+                format, bits
+            )
+            .into());
+        }
+    }
+
+    if samples.is_empty() {
+        return Err("WAV file contained no complete frames".into());
+    }
+
+    FarAudioSource::new(samples, spec.sample_rate, output_rate, output_channels)
+        .map_err(|e| e.into())
+}
+
+fn push_mapped_frame(
+    frame: &[i16],
+    source_channels: usize,
+    output_channels: usize,
+    out: &mut Vec<i16>,
+) {
+    if source_channels == 0 || output_channels == 0 {
+        return;
+    }
+    for dst in 0..output_channels {
+        let src_idx = if source_channels == 1 {
+            0
+        } else if dst < source_channels {
+            dst
+        } else {
+            source_channels - 1
+        };
+        out.push(frame[src_idx]);
+    }
 }
 
 fn build_output_stream(
     device: &Device,
     config: &StreamConfig,
     shared: Arc<Mutex<SharedCanceller>>,
-    phase_increment: f32,
+    far_source: Arc<Mutex<FarAudioSource>>,
     channels: usize,
     format: SampleFormat,
 ) -> Result<Stream, cpal::BuildStreamError> {
     match format {
-        SampleFormat::I16 => build_output_stream_i16(device, config, shared, phase_increment, channels),
-        SampleFormat::F32 => build_output_stream_f32(device, config, shared, phase_increment, channels),
-        SampleFormat::U16 => build_output_stream_u16(device, config, shared, phase_increment, channels),
+        SampleFormat::I16 => {
+            build_output_stream_i16(device, config, shared, far_source, channels)
+        }
+        SampleFormat::F32 => {
+            build_output_stream_f32(device, config, shared, far_source, channels)
+        }
+        SampleFormat::U16 => {
+            build_output_stream_u16(device, config, shared, far_source, channels)
+        }
         other => {
             eprintln!("Unsupported output sample format: {other:?}");
             Err(cpal::BuildStreamError::StreamConfigNotSupported)
@@ -370,27 +629,23 @@ fn build_output_stream_i16(
     device: &Device,
     config: &StreamConfig,
     shared: Arc<Mutex<SharedCanceller>>,
-    phase_increment: f32,
+    far_source: Arc<Mutex<FarAudioSource>>,
     channels: usize,
 ) -> Result<Stream, cpal::BuildStreamError> {
-    let mut phase = 0f32;
-    let mut far_frame = vec![0i16; channels];
+    let mut far_buffer = Vec::<i16>::new();
     device.build_output_stream(
         config,
         move |data: &mut [i16], _| {
-            let mut state = shared.lock().unwrap();
-            for frame in data.chunks_mut(channels) {
-                phase += phase_increment;
-                if phase > 2.0 * PI {
-                    phase -= 2.0 * PI;
-                }
-                let sample_i16 = (phase.sin() * 0.2 * i16::MAX as f32) as i16;
-                far_frame.fill(sample_i16);
-                for out_sample in frame.iter_mut() {
-                    *out_sample = sample_i16;
-                }
-                state.push_far_end(&far_frame);
+            if far_buffer.len() != data.len() {
+                far_buffer.resize(data.len(), 0);
             }
+            {
+                let mut source = far_source.lock().unwrap();
+                source.next_samples(&mut far_buffer);
+            }
+            data.copy_from_slice(&far_buffer);
+            let mut state = shared.lock().unwrap();
+            state.push_far_end(&far_buffer);
         },
         move |err| eprintln!("Output stream error: {err}"),
         None,
@@ -401,28 +656,25 @@ fn build_output_stream_f32(
     device: &Device,
     config: &StreamConfig,
     shared: Arc<Mutex<SharedCanceller>>,
-    phase_increment: f32,
+    far_source: Arc<Mutex<FarAudioSource>>,
     channels: usize,
 ) -> Result<Stream, cpal::BuildStreamError> {
-    let mut phase = 0f32;
-    let mut far_frame = vec![0i16; channels];
+    let mut far_buffer = Vec::<i16>::new();
     device.build_output_stream(
         config,
         move |data: &mut [f32], _| {
-            let mut state = shared.lock().unwrap();
-            for frame in data.chunks_mut(channels) {
-                phase += phase_increment;
-                if phase > 2.0 * PI {
-                    phase -= 2.0 * PI;
-                }
-                let sample_amp = (phase.sin() * 0.2).clamp(-1.0, 1.0);
-                let sample_i16 = (sample_amp * i16::MAX as f32) as i16;
-                far_frame.fill(sample_i16);
-                for out_sample in frame.iter_mut() {
-                    *out_sample = sample_amp;
-                }
-                state.push_far_end(&far_frame);
+            if far_buffer.len() != data.len() {
+                far_buffer.resize(data.len(), 0);
             }
+            {
+                let mut source = far_source.lock().unwrap();
+                source.next_samples(&mut far_buffer);
+            }
+            for (dst, src) in data.iter_mut().zip(far_buffer.iter()) {
+                *dst = (*src as f32) / i16::MAX as f32;
+            }
+            let mut state = shared.lock().unwrap();
+            state.push_far_end(&far_buffer);
         },
         move |err| eprintln!("Output stream error: {err}"),
         None,
@@ -433,30 +685,28 @@ fn build_output_stream_u16(
     device: &Device,
     config: &StreamConfig,
     shared: Arc<Mutex<SharedCanceller>>,
-    phase_increment: f32,
+    far_source: Arc<Mutex<FarAudioSource>>,
     channels: usize,
 ) -> Result<Stream, cpal::BuildStreamError> {
-    let mut phase = 0f32;
-    let mut far_frame = vec![0i16; channels];
+    let mut far_buffer = Vec::<i16>::new();
     device.build_output_stream(
         config,
         move |data: &mut [u16], _| {
-            let mut state = shared.lock().unwrap();
-            for frame in data.chunks_mut(channels) {
-                phase += phase_increment;
-                if phase > 2.0 * PI {
-                    phase -= 2.0 * PI;
-                }
-                let sample_amp = (phase.sin() * 0.2).clamp(-1.0, 1.0);
-                let sample_i16 = (sample_amp * i16::MAX as f32) as i16;
-                let sample_u16 = (((sample_amp + 1.0) * 0.5) * u16::MAX as f32)
-                    .clamp(0.0, u16::MAX as f32) as u16;
-                far_frame.fill(sample_i16);
-                for out_sample in frame.iter_mut() {
-                    *out_sample = sample_u16;
-                }
-                state.push_far_end(&far_frame);
+            if far_buffer.len() != data.len() {
+                far_buffer.resize(data.len(), 0);
             }
+            {
+                let mut source = far_source.lock().unwrap();
+                source.next_samples(&mut far_buffer);
+            }
+            for (dst, src) in data.iter_mut().zip(far_buffer.iter()) {
+                let normalized =
+                    (*src as f32 / i16::MAX as f32).clamp(-1.0_f32, 1.0_f32);
+                *dst = (((normalized + 1.0) * 0.5) * u16::MAX as f32)
+                    .clamp(0.0, u16::MAX as f32) as u16;
+            }
+            let mut state = shared.lock().unwrap();
+            state.push_far_end(&far_buffer);
         },
         move |err| eprintln!("Output stream error: {err}"),
         None,
