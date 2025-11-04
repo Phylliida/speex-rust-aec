@@ -3,4 +3,14 @@ name = "speex-rust-aec"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+cpal-example = ["cpal"]
+
 [dependencies]
+
+cpal = { version = "0.15", optional = true }
+
+[[example]]
+name = "cpal_aec"
+required-features = ["cpal-example"]

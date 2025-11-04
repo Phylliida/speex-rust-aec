@@ -23,6 +23,11 @@ pub mod c2rust;
 
 use std::ffi::c_int;
 
+pub use c2rust::speex_echo_h::{
+    SPEEX_ECHO_GET_FRAME_SIZE, SPEEX_ECHO_GET_IMPULSE_RESPONSE,
+    SPEEX_ECHO_GET_IMPULSE_RESPONSE_SIZE, SPEEX_ECHO_GET_SAMPLING_RATE,
+    SPEEX_ECHO_SET_SAMPLING_RATE,
+};
 pub use c2rust::mdf::{
     speex_echo_cancel, speex_echo_cancellation, speex_echo_capture, speex_echo_ctl,
     speex_echo_get_residual, speex_echo_playback, speex_echo_state_destroy,
@@ -131,6 +136,8 @@ impl EchoCanceller {
         self.state
     }
 }
+
+unsafe impl Send for EchoCanceller {}
 
 impl Drop for EchoCanceller {
     fn drop(&mut self) {
