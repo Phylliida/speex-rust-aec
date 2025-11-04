@@ -123,22 +123,22 @@ pub mod stdlib_h {
 pub mod os_support_h {
     #[inline]
     pub unsafe extern "C" fn speex_alloc(
-        mut size: std::ffi::c_int,
+        size: std::ffi::c_int,
     ) -> *mut std::ffi::c_void {
         return calloc(size as size_t, 1 as size_t);
     }
     #[inline]
-    pub unsafe extern "C" fn speex_free(mut ptr: *mut std::ffi::c_void) {
+    pub unsafe extern "C" fn speex_free(ptr: *mut std::ffi::c_void) {
         free(ptr);
     }
     #[inline]
-    pub unsafe extern "C" fn speex_warning(mut str: *const std::ffi::c_char) {
+    pub unsafe extern "C" fn speex_warning(str: *const std::ffi::c_char) {
         fprintf(stderr, b"warning: %s\n\0" as *const u8 as *const std::ffi::c_char, str);
     }
     #[inline]
     pub unsafe extern "C" fn speex_warning_int(
-        mut str: *const std::ffi::c_char,
-        mut val: std::ffi::c_int,
+        str: *const std::ffi::c_char,
+        val: std::ffi::c_int,
     ) {
         fprintf(
             stderr,
@@ -187,8 +187,6 @@ pub use self::struct_FILE_h::{
     _IO_FILE, _IO_lock_t, _IO_wide_data, _IO_codecvt, _IO_marker,
 };
 use self::fftwrap_h::{spx_fft_init, spx_fft_destroy, spx_fft, spx_ifft};
-use self::stdio_h::{stderr, fprintf};
-use self::stdlib_h::{calloc, free};
 pub use self::os_support_h::{speex_alloc, speex_free, speex_warning, speex_warning_int};
 pub use self::math_approx_h::spx_sqrt;
 pub use self::math_h::M_PI;
@@ -259,12 +257,12 @@ static mut VAR_BACKTRACK: std::ffi::c_float = 4.0f32;
 pub const PLAYBACK_DELAY: std::ffi::c_int = unsafe { 2 as std::ffi::c_int };
 #[inline]
 unsafe extern "C" fn filter_dc_notch16(
-    mut in_0: *const spx_int16_t,
-    mut radius: spx_word16_t,
-    mut out: *mut spx_word16_t,
-    mut len: std::ffi::c_int,
-    mut mem: *mut spx_mem_t,
-    mut stride: std::ffi::c_int,
+    in_0: *const spx_int16_t,
+    radius: spx_word16_t,
+    out: *mut spx_word16_t,
+    len: std::ffi::c_int,
+    mem: *mut spx_mem_t,
+    stride: std::ffi::c_int,
 ) {
     let mut i: std::ffi::c_int = 0;
     let mut den2: spx_word16_t = 0.;
@@ -274,8 +272,8 @@ unsafe extern "C" fn filter_dc_notch16(
         as spx_word16_t;
     i = 0 as std::ffi::c_int;
     while i < len {
-        let mut vin: spx_word16_t = *in_0.offset((i * stride) as isize) as spx_word16_t;
-        let mut vout: spx_word32_t = *mem.offset(0 as std::ffi::c_int as isize)
+        let vin: spx_word16_t = *in_0.offset((i * stride) as isize) as spx_word16_t;
+        let vout: spx_word32_t = *mem.offset(0 as std::ffi::c_int as isize)
             + vin as spx_word32_t;
         *mem.offset(0 as std::ffi::c_int as isize) = (*mem
             .offset(1 as std::ffi::c_int as isize)
@@ -318,9 +316,9 @@ unsafe extern "C" fn mdf_inner_prod(
 }
 #[inline]
 unsafe extern "C" fn power_spectrum(
-    mut X: *const spx_word16_t,
-    mut ps: *mut spx_word32_t,
-    mut N: std::ffi::c_int,
+    X: *const spx_word16_t,
+    ps: *mut spx_word32_t,
+    N: std::ffi::c_int,
 ) {
     let mut i: std::ffi::c_int = 0;
     let mut j: std::ffi::c_int = 0;
@@ -339,9 +337,9 @@ unsafe extern "C" fn power_spectrum(
 }
 #[inline]
 unsafe extern "C" fn power_spectrum_accum(
-    mut X: *const spx_word16_t,
-    mut ps: *mut spx_word32_t,
-    mut N: std::ffi::c_int,
+    X: *const spx_word16_t,
+    ps: *mut spx_word32_t,
+    N: std::ffi::c_int,
 ) {
     let mut i: std::ffi::c_int = 0;
     let mut j: std::ffi::c_int = 0;
@@ -364,9 +362,9 @@ unsafe extern "C" fn power_spectrum_accum(
 unsafe extern "C" fn spectral_mul_accum(
     mut X: *const spx_word16_t,
     mut Y: *const spx_word32_t,
-    mut acc: *mut spx_word16_t,
-    mut N: std::ffi::c_int,
-    mut M: std::ffi::c_int,
+    acc: *mut spx_word16_t,
+    N: std::ffi::c_int,
+    M: std::ffi::c_int,
 ) {
     let mut i: std::ffi::c_int = 0;
     let mut j: std::ffi::c_int = 0;
@@ -414,12 +412,12 @@ pub const spectral_mul_accum16: unsafe extern "C" fn(
 ) -> () = unsafe { spectral_mul_accum };
 #[inline]
 unsafe extern "C" fn weighted_spectral_mul_conj(
-    mut w: *const std::ffi::c_float,
+    w: *const std::ffi::c_float,
     p: std::ffi::c_float,
-    mut X: *const spx_word16_t,
-    mut Y: *const spx_word16_t,
-    mut prod: *mut spx_word32_t,
-    mut N: std::ffi::c_int,
+    X: *const spx_word16_t,
+    Y: *const spx_word16_t,
+    prod: *mut spx_word32_t,
+    N: std::ffi::c_int,
 ) {
     let mut i: std::ffi::c_int = 0;
     let mut j: std::ffi::c_int = 0;
@@ -449,11 +447,11 @@ unsafe extern "C" fn weighted_spectral_mul_conj(
 }
 #[inline]
 unsafe extern "C" fn mdf_adjust_prop(
-    mut W: *const spx_word32_t,
-    mut N: std::ffi::c_int,
-    mut M: std::ffi::c_int,
-    mut P: std::ffi::c_int,
-    mut prop: *mut spx_word16_t,
+    W: *const spx_word32_t,
+    N: std::ffi::c_int,
+    M: std::ffi::c_int,
+    P: std::ffi::c_int,
+    prop: *mut spx_word16_t,
 ) {
     let mut i: std::ffi::c_int = 0;
     let mut j: std::ffi::c_int = 0;
@@ -496,8 +494,8 @@ unsafe extern "C" fn mdf_adjust_prop(
 }
 #[no_mangle]
 pub unsafe extern "C" fn speex_echo_state_init(
-    mut frame_size: std::ffi::c_int,
-    mut filter_length: std::ffi::c_int,
+    frame_size: std::ffi::c_int,
+    filter_length: std::ffi::c_int,
 ) -> *mut SpeexEchoState {
     return speex_echo_state_init_mc(
         frame_size,
@@ -508,17 +506,17 @@ pub unsafe extern "C" fn speex_echo_state_init(
 }
 #[no_mangle]
 pub unsafe extern "C" fn speex_echo_state_init_mc(
-    mut frame_size: std::ffi::c_int,
-    mut filter_length: std::ffi::c_int,
-    mut nb_mic: std::ffi::c_int,
-    mut nb_speakers: std::ffi::c_int,
+    frame_size: std::ffi::c_int,
+    filter_length: std::ffi::c_int,
+    nb_mic: std::ffi::c_int,
+    nb_speakers: std::ffi::c_int,
 ) -> *mut SpeexEchoState {
     let mut i: std::ffi::c_int = 0;
     let mut N: std::ffi::c_int = 0;
     let mut M: std::ffi::c_int = 0;
     let mut C: std::ffi::c_int = 0;
     let mut K: std::ffi::c_int = 0;
-    let mut st: *mut SpeexEchoState = speex_alloc(
+    let st: *mut SpeexEchoState = speex_alloc(
         ::core::mem::size_of::<SpeexEchoState>() as std::ffi::c_int,
     ) as *mut SpeexEchoState;
     (*st).K = nb_speakers;
@@ -670,7 +668,7 @@ pub unsafe extern "C" fn speex_echo_state_init_mc(
         i += 1;
     }
     let mut sum: spx_word32_t = 0 as std::ffi::c_int as spx_word32_t;
-    let mut decay: spx_word16_t = exp(
+    let decay: spx_word16_t = exp(
         -(2.4f64 as spx_word16_t / M as spx_word16_t) as std::ffi::c_double,
     ) as spx_word16_t;
     *((*st).prop).offset(0 as std::ffi::c_int as isize) = 0.7f32;
@@ -734,7 +732,7 @@ pub unsafe extern "C" fn speex_echo_state_init_mc(
     return st;
 }
 #[no_mangle]
-pub unsafe extern "C" fn speex_echo_state_reset(mut st: *mut SpeexEchoState) {
+pub unsafe extern "C" fn speex_echo_state_reset(st: *mut SpeexEchoState) {
     let mut i: std::ffi::c_int = 0;
     let mut M: std::ffi::c_int = 0;
     let mut N: std::ffi::c_int = 0;
@@ -819,7 +817,7 @@ pub unsafe extern "C" fn speex_echo_state_reset(mut st: *mut SpeexEchoState) {
     (*st).play_buf_started = 0 as std::ffi::c_int;
 }
 #[no_mangle]
-pub unsafe extern "C" fn speex_echo_state_destroy(mut st: *mut SpeexEchoState) {
+pub unsafe extern "C" fn speex_echo_state_destroy(st: *mut SpeexEchoState) {
     spx_fft_destroy((*st).fft_table);
     speex_free((*st).e as *mut std::ffi::c_void);
     speex_free((*st).x as *mut std::ffi::c_void);
@@ -851,9 +849,9 @@ pub unsafe extern "C" fn speex_echo_state_destroy(mut st: *mut SpeexEchoState) {
 }
 #[no_mangle]
 pub unsafe extern "C" fn speex_echo_capture(
-    mut st: *mut SpeexEchoState,
-    mut rec: *const spx_int16_t,
-    mut out: *mut spx_int16_t,
+    st: *mut SpeexEchoState,
+    rec: *const spx_int16_t,
+    out: *mut spx_int16_t,
 ) {
     let mut i: std::ffi::c_int = 0;
     (*st).play_buf_started = 1 as std::ffi::c_int;
@@ -887,8 +885,8 @@ pub unsafe extern "C" fn speex_echo_capture(
 }
 #[no_mangle]
 pub unsafe extern "C" fn speex_echo_playback(
-    mut st: *mut SpeexEchoState,
-    mut play: *const spx_int16_t,
+    st: *mut SpeexEchoState,
+    play: *const spx_int16_t,
 ) {
     if (*st).play_buf_started == 0 {
         speex_warning(
@@ -929,20 +927,20 @@ pub unsafe extern "C" fn speex_echo_playback(
 }
 #[no_mangle]
 pub unsafe extern "C" fn speex_echo_cancel(
-    mut st: *mut SpeexEchoState,
-    mut in_0: *const spx_int16_t,
-    mut far_end: *const spx_int16_t,
-    mut out: *mut spx_int16_t,
-    mut Yout: *mut spx_int32_t,
+    st: *mut SpeexEchoState,
+    in_0: *const spx_int16_t,
+    far_end: *const spx_int16_t,
+    out: *mut spx_int16_t,
+    Yout: *mut spx_int32_t,
 ) {
     speex_echo_cancellation(st, in_0, far_end, out);
 }
 #[no_mangle]
 pub unsafe extern "C" fn speex_echo_cancellation(
-    mut st: *mut SpeexEchoState,
-    mut in_0: *const spx_int16_t,
-    mut far_end: *const spx_int16_t,
-    mut out: *mut spx_int16_t,
+    st: *mut SpeexEchoState,
+    in_0: *const spx_int16_t,
+    far_end: *const spx_int16_t,
+    out: *mut spx_int16_t,
 ) {
     let mut i: std::ffi::c_int = 0;
     let mut j: std::ffi::c_int = 0;
@@ -1565,9 +1563,9 @@ pub unsafe extern "C" fn speex_echo_cancellation(
 }
 #[no_mangle]
 pub unsafe extern "C" fn speex_echo_get_residual(
-    mut st: *mut SpeexEchoState,
-    mut residual_echo: *mut spx_word32_t,
-    mut len: std::ffi::c_int,
+    st: *mut SpeexEchoState,
+    residual_echo: *mut spx_word32_t,
+    len: std::ffi::c_int,
 ) {
     let mut i: std::ffi::c_int = 0;
     let mut leak2: spx_word16_t = 0.;
@@ -1595,9 +1593,9 @@ pub unsafe extern "C" fn speex_echo_get_residual(
 }
 #[no_mangle]
 pub unsafe extern "C" fn speex_echo_ctl(
-    mut st: *mut SpeexEchoState,
-    mut request: std::ffi::c_int,
-    mut ptr: *mut std::ffi::c_void,
+    st: *mut SpeexEchoState,
+    request: std::ffi::c_int,
+    ptr: *mut std::ffi::c_void,
 ) -> std::ffi::c_int {
     match request {
         SPEEX_ECHO_GET_FRAME_SIZE => {
@@ -1626,12 +1624,12 @@ pub unsafe extern "C" fn speex_echo_ctl(
             *(ptr as *mut spx_int32_t) = ((*st).M * (*st).frame_size) as spx_int32_t;
         }
         SPEEX_ECHO_GET_IMPULSE_RESPONSE => {
-            let mut M: std::ffi::c_int = (*st).M;
-            let mut N: std::ffi::c_int = (*st).window_size;
-            let mut n: std::ffi::c_int = (*st).frame_size;
+            let M: std::ffi::c_int = (*st).M;
+            let N: std::ffi::c_int = (*st).window_size;
+            let n: std::ffi::c_int = (*st).frame_size;
             let mut i: std::ffi::c_int = 0;
             let mut j: std::ffi::c_int = 0;
-            let mut filt: *mut spx_int32_t = ptr as *mut spx_int32_t;
+            let filt: *mut spx_int32_t = ptr as *mut spx_int32_t;
             j = 0 as std::ffi::c_int;
             while j < M {
                 spx_ifft(

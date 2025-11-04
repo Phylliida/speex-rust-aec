@@ -14,17 +14,17 @@ pub struct drft_lookup {
 }
 pub type size_t = usize;
 #[inline]
-unsafe extern "C" fn speex_alloc(mut size: std::ffi::c_int) -> *mut std::ffi::c_void {
+unsafe extern "C" fn speex_alloc(size: std::ffi::c_int) -> *mut std::ffi::c_void {
     return calloc(size as size_t, 1 as size_t);
 }
 #[inline]
-unsafe extern "C" fn speex_free(mut ptr: *mut std::ffi::c_void) {
+unsafe extern "C" fn speex_free(ptr: *mut std::ffi::c_void) {
     free(ptr);
 }
 unsafe extern "C" fn drfti1(
-    mut n: std::ffi::c_int,
-    mut wa: *mut std::ffi::c_float,
-    mut ifac: *mut std::ffi::c_int,
+    n: std::ffi::c_int,
+    wa: *mut std::ffi::c_float,
+    ifac: *mut std::ffi::c_int,
 ) {
     static mut ntryh: [std::ffi::c_int; 4] = [
         4 as std::ffi::c_int,
@@ -132,9 +132,9 @@ unsafe extern "C" fn drfti1(
     }
 }
 unsafe extern "C" fn fdrffti(
-    mut n: std::ffi::c_int,
-    mut wsave: *mut std::ffi::c_float,
-    mut ifac: *mut std::ffi::c_int,
+    n: std::ffi::c_int,
+    wsave: *mut std::ffi::c_float,
+    ifac: *mut std::ffi::c_int,
 ) {
     if n == 1 as std::ffi::c_int {
         return;
@@ -142,11 +142,11 @@ unsafe extern "C" fn fdrffti(
     drfti1(n, wsave.offset(n as isize), ifac);
 }
 unsafe extern "C" fn dradf2(
-    mut ido: std::ffi::c_int,
-    mut l1: std::ffi::c_int,
-    mut cc: *mut std::ffi::c_float,
-    mut ch: *mut std::ffi::c_float,
-    mut wa1: *mut std::ffi::c_float,
+    ido: std::ffi::c_int,
+    l1: std::ffi::c_int,
+    cc: *mut std::ffi::c_float,
+    ch: *mut std::ffi::c_float,
+    wa1: *mut std::ffi::c_float,
 ) {
     let mut i: std::ffi::c_int = 0;
     let mut k: std::ffi::c_int = 0;
@@ -232,13 +232,13 @@ unsafe extern "C" fn dradf2(
     }
 }
 unsafe extern "C" fn dradf4(
-    mut ido: std::ffi::c_int,
-    mut l1: std::ffi::c_int,
-    mut cc: *mut std::ffi::c_float,
-    mut ch: *mut std::ffi::c_float,
-    mut wa1: *mut std::ffi::c_float,
-    mut wa2: *mut std::ffi::c_float,
-    mut wa3: *mut std::ffi::c_float,
+    ido: std::ffi::c_int,
+    l1: std::ffi::c_int,
+    cc: *mut std::ffi::c_float,
+    ch: *mut std::ffi::c_float,
+    wa1: *mut std::ffi::c_float,
+    wa2: *mut std::ffi::c_float,
+    wa3: *mut std::ffi::c_float,
 ) {
     static mut hsqt2: std::ffi::c_float = 0.70710678118654752f32;
     let mut i: std::ffi::c_int = 0;
@@ -382,16 +382,16 @@ unsafe extern "C" fn dradf4(
     }
 }
 unsafe extern "C" fn dradfg(
-    mut ido: std::ffi::c_int,
-    mut ip: std::ffi::c_int,
-    mut l1: std::ffi::c_int,
-    mut idl1: std::ffi::c_int,
-    mut cc: *mut std::ffi::c_float,
-    mut c1: *mut std::ffi::c_float,
-    mut c2: *mut std::ffi::c_float,
-    mut ch: *mut std::ffi::c_float,
-    mut ch2: *mut std::ffi::c_float,
-    mut wa: *mut std::ffi::c_float,
+    ido: std::ffi::c_int,
+    ip: std::ffi::c_int,
+    l1: std::ffi::c_int,
+    idl1: std::ffi::c_int,
+    cc: *mut std::ffi::c_float,
+    c1: *mut std::ffi::c_float,
+    c2: *mut std::ffi::c_float,
+    ch: *mut std::ffi::c_float,
+    ch2: *mut std::ffi::c_float,
+    wa: *mut std::ffi::c_float,
 ) {
     static mut tpi: std::ffi::c_float = 6.283185307179586f32;
     let mut idij: std::ffi::c_int = 0;
@@ -837,11 +837,11 @@ unsafe extern "C" fn dradfg(
     };
 }
 unsafe extern "C" fn drftf1(
-    mut n: std::ffi::c_int,
-    mut c: *mut std::ffi::c_float,
-    mut ch: *mut std::ffi::c_float,
-    mut wa: *mut std::ffi::c_float,
-    mut ifac: *mut std::ffi::c_int,
+    n: std::ffi::c_int,
+    c: *mut std::ffi::c_float,
+    ch: *mut std::ffi::c_float,
+    wa: *mut std::ffi::c_float,
+    ifac: *mut std::ffi::c_int,
 ) {
     let mut i: std::ffi::c_int = 0;
     let mut k1: std::ffi::c_int = 0;
@@ -958,11 +958,11 @@ unsafe extern "C" fn drftf1(
     }
 }
 unsafe extern "C" fn dradb2(
-    mut ido: std::ffi::c_int,
-    mut l1: std::ffi::c_int,
-    mut cc: *mut std::ffi::c_float,
-    mut ch: *mut std::ffi::c_float,
-    mut wa1: *mut std::ffi::c_float,
+    ido: std::ffi::c_int,
+    l1: std::ffi::c_int,
+    cc: *mut std::ffi::c_float,
+    ch: *mut std::ffi::c_float,
+    wa1: *mut std::ffi::c_float,
 ) {
     let mut i: std::ffi::c_int = 0;
     let mut k: std::ffi::c_int = 0;
@@ -1045,12 +1045,12 @@ unsafe extern "C" fn dradb2(
     }
 }
 unsafe extern "C" fn dradb3(
-    mut ido: std::ffi::c_int,
-    mut l1: std::ffi::c_int,
-    mut cc: *mut std::ffi::c_float,
-    mut ch: *mut std::ffi::c_float,
-    mut wa1: *mut std::ffi::c_float,
-    mut wa2: *mut std::ffi::c_float,
+    ido: std::ffi::c_int,
+    l1: std::ffi::c_int,
+    cc: *mut std::ffi::c_float,
+    ch: *mut std::ffi::c_float,
+    wa1: *mut std::ffi::c_float,
+    wa2: *mut std::ffi::c_float,
 ) {
     static mut taur: std::ffi::c_float = -0.5f32;
     static mut taui: std::ffi::c_float = 0.8660254037844386f32;
@@ -1151,13 +1151,13 @@ unsafe extern "C" fn dradb3(
     }
 }
 unsafe extern "C" fn dradb4(
-    mut ido: std::ffi::c_int,
-    mut l1: std::ffi::c_int,
-    mut cc: *mut std::ffi::c_float,
-    mut ch: *mut std::ffi::c_float,
-    mut wa1: *mut std::ffi::c_float,
-    mut wa2: *mut std::ffi::c_float,
-    mut wa3: *mut std::ffi::c_float,
+    ido: std::ffi::c_int,
+    l1: std::ffi::c_int,
+    cc: *mut std::ffi::c_float,
+    ch: *mut std::ffi::c_float,
+    wa1: *mut std::ffi::c_float,
+    wa2: *mut std::ffi::c_float,
+    wa3: *mut std::ffi::c_float,
 ) {
     static mut sqrt2: std::ffi::c_float = 1.414213562373095f32;
     let mut i: std::ffi::c_int = 0;
@@ -1307,16 +1307,16 @@ unsafe extern "C" fn dradb4(
     }
 }
 unsafe extern "C" fn dradbg(
-    mut ido: std::ffi::c_int,
-    mut ip: std::ffi::c_int,
-    mut l1: std::ffi::c_int,
-    mut idl1: std::ffi::c_int,
-    mut cc: *mut std::ffi::c_float,
-    mut c1: *mut std::ffi::c_float,
-    mut c2: *mut std::ffi::c_float,
-    mut ch: *mut std::ffi::c_float,
-    mut ch2: *mut std::ffi::c_float,
-    mut wa: *mut std::ffi::c_float,
+    ido: std::ffi::c_int,
+    ip: std::ffi::c_int,
+    l1: std::ffi::c_int,
+    idl1: std::ffi::c_int,
+    cc: *mut std::ffi::c_float,
+    c1: *mut std::ffi::c_float,
+    c2: *mut std::ffi::c_float,
+    ch: *mut std::ffi::c_float,
+    ch2: *mut std::ffi::c_float,
+    wa: *mut std::ffi::c_float,
 ) {
     static mut tpi: std::ffi::c_float = 6.283185307179586f32;
     let mut idij: std::ffi::c_int = 0;
@@ -1776,11 +1776,11 @@ unsafe extern "C" fn dradbg(
     };
 }
 unsafe extern "C" fn drftb1(
-    mut n: std::ffi::c_int,
-    mut c: *mut std::ffi::c_float,
-    mut ch: *mut std::ffi::c_float,
-    mut wa: *mut std::ffi::c_float,
-    mut ifac: *mut std::ffi::c_int,
+    n: std::ffi::c_int,
+    c: *mut std::ffi::c_float,
+    ch: *mut std::ffi::c_float,
+    wa: *mut std::ffi::c_float,
+    ifac: *mut std::ffi::c_int,
 ) {
     let mut i: std::ffi::c_int = 0;
     let mut k1: std::ffi::c_int = 0;
@@ -1933,8 +1933,8 @@ unsafe extern "C" fn drftb1(
 }
 #[no_mangle]
 pub unsafe extern "C" fn spx_drft_forward(
-    mut l: *mut drft_lookup,
-    mut data: *mut std::ffi::c_float,
+    l: *mut drft_lookup,
+    data: *mut std::ffi::c_float,
 ) {
     if (*l).n == 1 as std::ffi::c_int {
         return;
@@ -1949,8 +1949,8 @@ pub unsafe extern "C" fn spx_drft_forward(
 }
 #[no_mangle]
 pub unsafe extern "C" fn spx_drft_backward(
-    mut l: *mut drft_lookup,
-    mut data: *mut std::ffi::c_float,
+    l: *mut drft_lookup,
+    data: *mut std::ffi::c_float,
 ) {
     if (*l).n == 1 as std::ffi::c_int {
         return;
@@ -1964,7 +1964,7 @@ pub unsafe extern "C" fn spx_drft_backward(
     );
 }
 #[no_mangle]
-pub unsafe extern "C" fn spx_drft_init(mut l: *mut drft_lookup, mut n: std::ffi::c_int) {
+pub unsafe extern "C" fn spx_drft_init(l: *mut drft_lookup, n: std::ffi::c_int) {
     (*l).n = n;
     (*l).trigcache = speex_alloc(
         ((3 as std::ffi::c_int * n) as std::ffi::c_ulong)
@@ -1980,7 +1980,7 @@ pub unsafe extern "C" fn spx_drft_init(mut l: *mut drft_lookup, mut n: std::ffi:
     fdrffti(n, (*l).trigcache, (*l).splitcache);
 }
 #[no_mangle]
-pub unsafe extern "C" fn spx_drft_clear(mut l: *mut drft_lookup) {
+pub unsafe extern "C" fn spx_drft_clear(l: *mut drft_lookup) {
     if !l.is_null() {
         if !((*l).trigcache).is_null() {
             speex_free((*l).trigcache as *mut std::ffi::c_void);

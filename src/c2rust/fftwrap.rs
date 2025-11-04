@@ -71,20 +71,20 @@ pub struct drft_lookup {
     pub splitcache: *mut std::ffi::c_int,
 }
 #[inline]
-unsafe extern "C" fn speex_alloc(mut size: std::ffi::c_int) -> *mut std::ffi::c_void {
+unsafe extern "C" fn speex_alloc(size: std::ffi::c_int) -> *mut std::ffi::c_void {
     return calloc(size as size_t, 1 as size_t);
 }
 #[inline]
-unsafe extern "C" fn speex_free(mut ptr: *mut std::ffi::c_void) {
+unsafe extern "C" fn speex_free(ptr: *mut std::ffi::c_void) {
     free(ptr);
 }
 #[inline]
-unsafe extern "C" fn speex_warning(mut str: *const std::ffi::c_char) {
+unsafe extern "C" fn speex_warning(str: *const std::ffi::c_char) {
     fprintf(stderr, b"warning: %s\n\0" as *const u8 as *const std::ffi::c_char, str);
 }
 #[no_mangle]
 pub unsafe extern "C" fn spx_fft_init(
-    mut size: std::ffi::c_int,
+    size: std::ffi::c_int,
 ) -> *mut std::ffi::c_void {
     let mut table: *mut drft_lookup = 0 as *mut drft_lookup;
     table = speex_alloc(::core::mem::size_of::<drft_lookup>() as std::ffi::c_int)
@@ -93,19 +93,19 @@ pub unsafe extern "C" fn spx_fft_init(
     return table as *mut std::ffi::c_void;
 }
 #[no_mangle]
-pub unsafe extern "C" fn spx_fft_destroy(mut table: *mut std::ffi::c_void) {
+pub unsafe extern "C" fn spx_fft_destroy(table: *mut std::ffi::c_void) {
     spx_drft_clear(table as *mut drft_lookup);
     speex_free(table);
 }
 #[no_mangle]
 pub unsafe extern "C" fn spx_fft(
-    mut table: *mut std::ffi::c_void,
-    mut in_0: *mut std::ffi::c_float,
-    mut out: *mut std::ffi::c_float,
+    table: *mut std::ffi::c_void,
+    in_0: *mut std::ffi::c_float,
+    out: *mut std::ffi::c_float,
 ) {
     if in_0 == out {
         let mut i: std::ffi::c_int = 0;
-        let mut scale: std::ffi::c_float = (1.0f64
+        let scale: std::ffi::c_float = (1.0f64
             / (*(table as *mut drft_lookup)).n as std::ffi::c_double)
             as std::ffi::c_float;
         speex_warning(
@@ -118,7 +118,7 @@ pub unsafe extern "C" fn spx_fft(
         }
     } else {
         let mut i_0: std::ffi::c_int = 0;
-        let mut scale_0: std::ffi::c_float = (1.0f64
+        let scale_0: std::ffi::c_float = (1.0f64
             / (*(table as *mut drft_lookup)).n as std::ffi::c_double)
             as std::ffi::c_float;
         i_0 = 0 as std::ffi::c_int;
@@ -131,9 +131,9 @@ pub unsafe extern "C" fn spx_fft(
 }
 #[no_mangle]
 pub unsafe extern "C" fn spx_ifft(
-    mut table: *mut std::ffi::c_void,
-    mut in_0: *mut std::ffi::c_float,
-    mut out: *mut std::ffi::c_float,
+    table: *mut std::ffi::c_void,
+    in_0: *mut std::ffi::c_float,
+    out: *mut std::ffi::c_float,
 ) {
     if in_0 == out {
         speex_warning(
@@ -151,17 +151,17 @@ pub unsafe extern "C" fn spx_ifft(
 }
 #[no_mangle]
 pub unsafe extern "C" fn spx_fft_float(
-    mut table: *mut std::ffi::c_void,
-    mut in_0: *mut std::ffi::c_float,
-    mut out: *mut std::ffi::c_float,
+    table: *mut std::ffi::c_void,
+    in_0: *mut std::ffi::c_float,
+    out: *mut std::ffi::c_float,
 ) {
     spx_fft(table, in_0, out);
 }
 #[no_mangle]
 pub unsafe extern "C" fn spx_ifft_float(
-    mut table: *mut std::ffi::c_void,
-    mut in_0: *mut std::ffi::c_float,
-    mut out: *mut std::ffi::c_float,
+    table: *mut std::ffi::c_void,
+    in_0: *mut std::ffi::c_float,
+    out: *mut std::ffi::c_float,
 ) {
     spx_ifft(table, in_0, out);
 }

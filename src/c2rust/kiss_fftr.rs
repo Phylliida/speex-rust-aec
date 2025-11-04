@@ -94,14 +94,14 @@ pub struct kiss_fftr_state {
 pub type kiss_fftr_cfg = *mut kiss_fftr_state;
 pub const NULL: std::ffi::c_int = unsafe { 0 as std::ffi::c_int };
 #[inline]
-unsafe extern "C" fn speex_alloc(mut size: std::ffi::c_int) -> *mut std::ffi::c_void {
+unsafe extern "C" fn speex_alloc(size: std::ffi::c_int) -> *mut std::ffi::c_void {
     return calloc(size as size_t, 1 as size_t);
 }
 #[inline]
 unsafe extern "C" fn _speex_fatal(
-    mut str: *const std::ffi::c_char,
-    mut file: *const std::ffi::c_char,
-    mut line: std::ffi::c_int,
+    str: *const std::ffi::c_char,
+    file: *const std::ffi::c_char,
+    line: std::ffi::c_int,
 ) {
     fprintf(
         stderr,
@@ -114,7 +114,7 @@ unsafe extern "C" fn _speex_fatal(
     exit(1 as std::ffi::c_int);
 }
 #[inline]
-unsafe extern "C" fn speex_warning(mut str: *const std::ffi::c_char) {
+unsafe extern "C" fn speex_warning(str: *const std::ffi::c_char) {
     fprintf(stderr, b"warning: %s\n\0" as *const u8 as *const std::ffi::c_char, str);
 }
 pub const KISS_FFT_MALLOC: unsafe extern "C" fn(
@@ -123,9 +123,9 @@ pub const KISS_FFT_MALLOC: unsafe extern "C" fn(
 #[no_mangle]
 pub unsafe extern "C" fn kiss_fftr_alloc(
     mut nfft: std::ffi::c_int,
-    mut inverse_fft: std::ffi::c_int,
-    mut mem: *mut std::ffi::c_void,
-    mut lenmem: *mut size_t,
+    inverse_fft: std::ffi::c_int,
+    mem: *mut std::ffi::c_void,
+    lenmem: *mut size_t,
 ) -> kiss_fftr_cfg {
     let mut i: std::ffi::c_int = 0;
     let mut st: kiss_fftr_cfg = NULL as kiss_fftr_cfg;
@@ -183,9 +183,9 @@ pub unsafe extern "C" fn kiss_fftr_alloc(
 }
 #[no_mangle]
 pub unsafe extern "C" fn kiss_fftr(
-    mut st: kiss_fftr_cfg,
-    mut timedata: *const std::ffi::c_float,
-    mut freqdata: *mut kiss_fft_cpx,
+    st: kiss_fftr_cfg,
+    timedata: *const std::ffi::c_float,
+    freqdata: *mut kiss_fft_cpx,
 ) {
     let mut k: std::ffi::c_int = 0;
     let mut ncfft: std::ffi::c_int = 0;
@@ -239,9 +239,9 @@ pub unsafe extern "C" fn kiss_fftr(
 }
 #[no_mangle]
 pub unsafe extern "C" fn kiss_fftri(
-    mut st: kiss_fftr_cfg,
-    mut freqdata: *const kiss_fft_cpx,
-    mut timedata: *mut std::ffi::c_float,
+    st: kiss_fftr_cfg,
+    freqdata: *const kiss_fft_cpx,
+    timedata: *mut std::ffi::c_float,
 ) {
     let mut k: std::ffi::c_int = 0;
     let mut ncfft: std::ffi::c_int = 0;
@@ -291,9 +291,9 @@ pub unsafe extern "C" fn kiss_fftri(
 }
 #[no_mangle]
 pub unsafe extern "C" fn kiss_fftr2(
-    mut st: kiss_fftr_cfg,
-    mut timedata: *const std::ffi::c_float,
-    mut freqdata: *mut std::ffi::c_float,
+    st: kiss_fftr_cfg,
+    timedata: *const std::ffi::c_float,
+    freqdata: *mut std::ffi::c_float,
 ) {
     let mut k: std::ffi::c_int = 0;
     let mut ncfft: std::ffi::c_int = 0;
@@ -348,9 +348,9 @@ pub unsafe extern "C" fn kiss_fftr2(
 }
 #[no_mangle]
 pub unsafe extern "C" fn kiss_fftri2(
-    mut st: kiss_fftr_cfg,
-    mut freqdata: *const std::ffi::c_float,
-    mut timedata: *mut std::ffi::c_float,
+    st: kiss_fftr_cfg,
+    freqdata: *const std::ffi::c_float,
+    timedata: *mut std::ffi::c_float,
 ) {
     let mut k: std::ffi::c_int = 0;
     let mut ncfft: std::ffi::c_int = 0;

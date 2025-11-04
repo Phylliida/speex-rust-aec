@@ -84,14 +84,14 @@ pub const KISS_FFT_MALLOC: unsafe extern "C" fn(
     std::ffi::c_int,
 ) -> *mut std::ffi::c_void = unsafe { speex_alloc };
 #[inline]
-unsafe extern "C" fn speex_alloc(mut size: std::ffi::c_int) -> *mut std::ffi::c_void {
+unsafe extern "C" fn speex_alloc(size: std::ffi::c_int) -> *mut std::ffi::c_void {
     return calloc(size as size_t, 1 as size_t);
 }
 #[inline]
 unsafe extern "C" fn _speex_fatal(
-    mut str: *const std::ffi::c_char,
-    mut file: *const std::ffi::c_char,
-    mut line: std::ffi::c_int,
+    str: *const std::ffi::c_char,
+    file: *const std::ffi::c_char,
+    line: std::ffi::c_int,
 ) {
     fprintf(
         stderr,
@@ -107,9 +107,9 @@ unsafe extern "C" fn kf_bfly2(
     mut Fout: *mut kiss_fft_cpx,
     fstride: size_t,
     st: kiss_fft_cfg,
-    mut m: std::ffi::c_int,
-    mut N: std::ffi::c_int,
-    mut mm: std::ffi::c_int,
+    m: std::ffi::c_int,
+    N: std::ffi::c_int,
+    mm: std::ffi::c_int,
 ) {
     let mut Fout2: *mut kiss_fft_cpx = 0 as *mut kiss_fft_cpx;
     let mut tw1: *mut kiss_fft_cpx = 0 as *mut kiss_fft_cpx;
@@ -117,7 +117,7 @@ unsafe extern "C" fn kf_bfly2(
     if (*st).inverse == 0 {
         let mut i: std::ffi::c_int = 0;
         let mut j: std::ffi::c_int = 0;
-        let mut Fout_beg: *mut kiss_fft_cpx = Fout;
+        let Fout_beg: *mut kiss_fft_cpx = Fout;
         i = 0 as std::ffi::c_int;
         while i < N {
             Fout = Fout_beg.offset((i * mm) as isize);
@@ -143,7 +143,7 @@ unsafe extern "C" fn kf_bfly2(
     } else {
         let mut i_0: std::ffi::c_int = 0;
         let mut j_0: std::ffi::c_int = 0;
-        let mut Fout_beg_0: *mut kiss_fft_cpx = Fout;
+        let Fout_beg_0: *mut kiss_fft_cpx = Fout;
         i_0 = 0 as std::ffi::c_int;
         while i_0 < N {
             Fout = Fout_beg_0.offset((i_0 * mm) as isize);
@@ -170,9 +170,9 @@ unsafe extern "C" fn kf_bfly4(
     mut Fout: *mut kiss_fft_cpx,
     fstride: size_t,
     st: kiss_fft_cfg,
-    mut m: std::ffi::c_int,
-    mut N: std::ffi::c_int,
-    mut mm: std::ffi::c_int,
+    m: std::ffi::c_int,
+    N: std::ffi::c_int,
+    mm: std::ffi::c_int,
 ) {
     let mut tw1: *mut kiss_fft_cpx = 0 as *mut kiss_fft_cpx;
     let mut tw2: *mut kiss_fft_cpx = 0 as *mut kiss_fft_cpx;
@@ -183,7 +183,7 @@ unsafe extern "C" fn kf_bfly4(
     let mut i: std::ffi::c_int = 0;
     let mut j: std::ffi::c_int = 0;
     if (*st).inverse != 0 {
-        let mut Fout_beg: *mut kiss_fft_cpx = Fout;
+        let Fout_beg: *mut kiss_fft_cpx = Fout;
         i = 0 as std::ffi::c_int;
         while i < N {
             Fout = Fout_beg.offset((i * mm) as isize);
@@ -245,7 +245,7 @@ unsafe extern "C" fn kf_bfly4(
             i += 1;
         }
     } else {
-        let mut Fout_beg_0: *mut kiss_fft_cpx = Fout;
+        let Fout_beg_0: *mut kiss_fft_cpx = Fout;
         i = 0 as std::ffi::c_int;
         while i < N {
             Fout = Fout_beg_0.offset((i * mm) as isize);
@@ -316,7 +316,7 @@ unsafe extern "C" fn kf_bfly3(
     mut Fout: *mut kiss_fft_cpx,
     fstride: size_t,
     st: kiss_fft_cfg,
-    mut m: size_t,
+    m: size_t,
 ) {
     let mut k: size_t = m;
     let m2: size_t = (2 as size_t).wrapping_mul(m);
@@ -371,10 +371,10 @@ unsafe extern "C" fn kf_bfly3(
     };
 }
 unsafe extern "C" fn kf_bfly5(
-    mut Fout: *mut kiss_fft_cpx,
+    Fout: *mut kiss_fft_cpx,
     fstride: size_t,
     st: kiss_fft_cfg,
-    mut m: std::ffi::c_int,
+    m: std::ffi::c_int,
 ) {
     let mut Fout0: *mut kiss_fft_cpx = 0 as *mut kiss_fft_cpx;
     let mut Fout1: *mut kiss_fft_cpx = 0 as *mut kiss_fft_cpx;
@@ -383,7 +383,7 @@ unsafe extern "C" fn kf_bfly5(
     let mut Fout4: *mut kiss_fft_cpx = 0 as *mut kiss_fft_cpx;
     let mut u: std::ffi::c_int = 0;
     let mut scratch: [kiss_fft_cpx; 13] = [kiss_fft_cpx { r: 0., i: 0. }; 13];
-    let mut twiddles: *mut kiss_fft_cpx = ((*st).twiddles).as_mut_ptr();
+    let twiddles: *mut kiss_fft_cpx = ((*st).twiddles).as_mut_ptr();
     let mut tw: *mut kiss_fft_cpx = 0 as *mut kiss_fft_cpx;
     let mut ya: kiss_fft_cpx = kiss_fft_cpx { r: 0., i: 0. };
     let mut yb: kiss_fft_cpx = kiss_fft_cpx { r: 0., i: 0. };
@@ -559,20 +559,20 @@ unsafe extern "C" fn kf_bfly5(
     }
 }
 unsafe extern "C" fn kf_bfly_generic(
-    mut Fout: *mut kiss_fft_cpx,
+    Fout: *mut kiss_fft_cpx,
     fstride: size_t,
     st: kiss_fft_cfg,
-    mut m: std::ffi::c_int,
-    mut p: std::ffi::c_int,
+    m: std::ffi::c_int,
+    p: std::ffi::c_int,
 ) {
     let mut u: std::ffi::c_int = 0;
     let mut k: std::ffi::c_int = 0;
     let mut q1: std::ffi::c_int = 0;
     let mut q: std::ffi::c_int = 0;
-    let mut twiddles: *mut kiss_fft_cpx = ((*st).twiddles).as_mut_ptr();
+    let twiddles: *mut kiss_fft_cpx = ((*st).twiddles).as_mut_ptr();
     let mut t: kiss_fft_cpx = kiss_fft_cpx { r: 0., i: 0. };
     let mut scratchbuf: [kiss_fft_cpx; 17] = [kiss_fft_cpx { r: 0., i: 0. }; 17];
-    let mut Norig: std::ffi::c_int = (*st).nfft;
+    let Norig: std::ffi::c_int = (*st).nfft;
     if p > 17 as std::ffi::c_int {
         _speex_fatal(
             b"KissFFT: max radix supported is 17\0" as *const u8
@@ -622,7 +622,7 @@ unsafe extern "C" fn kf_shuffle(
     mut Fout: *mut kiss_fft_cpx,
     mut f: *const kiss_fft_cpx,
     fstride: size_t,
-    mut in_stride: std::ffi::c_int,
+    in_stride: std::ffi::c_int,
     mut factors: *mut std::ffi::c_int,
     st: kiss_fft_cfg,
 ) {
@@ -660,17 +660,17 @@ unsafe extern "C" fn kf_shuffle(
 }
 unsafe extern "C" fn kf_work(
     mut Fout: *mut kiss_fft_cpx,
-    mut f: *const kiss_fft_cpx,
+    f: *const kiss_fft_cpx,
     fstride: size_t,
-    mut in_stride: std::ffi::c_int,
+    in_stride: std::ffi::c_int,
     mut factors: *mut std::ffi::c_int,
     st: kiss_fft_cfg,
-    mut N: std::ffi::c_int,
-    mut s2: std::ffi::c_int,
-    mut m2: std::ffi::c_int,
+    N: std::ffi::c_int,
+    s2: std::ffi::c_int,
+    m2: std::ffi::c_int,
 ) {
     let mut i: std::ffi::c_int = 0;
-    let mut Fout_beg: *mut kiss_fft_cpx = Fout;
+    let Fout_beg: *mut kiss_fft_cpx = Fout;
     let fresh2 = factors;
     factors = factors.offset(1);
     let p: std::ffi::c_int = *fresh2;
@@ -759,13 +759,13 @@ unsafe extern "C" fn kf_factor(
 }
 #[no_mangle]
 pub unsafe extern "C" fn kiss_fft_alloc(
-    mut nfft: std::ffi::c_int,
-    mut inverse_fft: std::ffi::c_int,
-    mut mem: *mut std::ffi::c_void,
-    mut lenmem: *mut size_t,
+    nfft: std::ffi::c_int,
+    inverse_fft: std::ffi::c_int,
+    mem: *mut std::ffi::c_void,
+    lenmem: *mut size_t,
 ) -> kiss_fft_cfg {
     let mut st: kiss_fft_cfg = NULL as kiss_fft_cfg;
-    let mut memneeded: size_t = (::core::mem::size_of::<kiss_fft_state>() as size_t)
+    let memneeded: size_t = (::core::mem::size_of::<kiss_fft_state>() as size_t)
         .wrapping_add(
             (::core::mem::size_of::<kiss_fft_cpx>() as size_t)
                 .wrapping_mul((nfft - 1 as std::ffi::c_int) as size_t),
@@ -803,10 +803,10 @@ pub unsafe extern "C" fn kiss_fft_alloc(
 }
 #[no_mangle]
 pub unsafe extern "C" fn kiss_fft_stride(
-    mut st: kiss_fft_cfg,
-    mut fin: *const kiss_fft_cpx,
-    mut fout: *mut kiss_fft_cpx,
-    mut in_stride: std::ffi::c_int,
+    st: kiss_fft_cfg,
+    fin: *const kiss_fft_cpx,
+    fout: *mut kiss_fft_cpx,
+    in_stride: std::ffi::c_int,
 ) {
     if fin == fout as *const kiss_fft_cpx {
         _speex_fatal(
@@ -832,9 +832,9 @@ pub unsafe extern "C" fn kiss_fft_stride(
 }
 #[no_mangle]
 pub unsafe extern "C" fn kiss_fft(
-    mut cfg: kiss_fft_cfg,
-    mut fin: *const kiss_fft_cpx,
-    mut fout: *mut kiss_fft_cpx,
+    cfg: kiss_fft_cfg,
+    fin: *const kiss_fft_cpx,
+    fout: *mut kiss_fft_cpx,
 ) {
     kiss_fft_stride(cfg, fin, fout, 1 as std::ffi::c_int);
 }
