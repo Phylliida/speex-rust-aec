@@ -346,6 +346,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             sample_format: hound::SampleFormat::Int,
         };
         let mut writer = hound::WavWriter::create(&recording_path, spec)?;
+        println!("Writing samples of length {}", recorded_samples.len());
         for sample in recorded_samples {
             writer.write_sample(sample)?;
         }
