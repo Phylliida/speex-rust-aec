@@ -895,6 +895,11 @@ where
     )
 }
 
+struct AudioBufferMetadata {
+    num_frames: u64,
+    target_emitted_frames: i128
+}
+
 struct StreamAligner {
     start_time: Option<std::time::Instant>,
     input_sample_rate: i128,
@@ -902,6 +907,8 @@ struct StreamAligner {
     dynamic_output_sample_rate: i128,
     input_audio_buffer_producer: HeapProd<u64>,
     input_audio_buffer_consumer: HeapCons<u64>,
+    input_audio_buffer_metadata_producer: HeapProd<AudioBufferMetadata>,
+    input_audio_buffer_metadata_consumer: HeapCons<AudioBufferMetadata>,
     chunk_sizes: LocalRb<u64>, // only accessed by the audio push thread
     system_time_in_frames_when_chunk_ended: LocalRb<i128>, // only accessed by the audio input thread
     target_emitted_frames: AtomicU64
@@ -915,12 +922,15 @@ impl StreamAligner {
     // to ensure the outputs stay aligned with system clock
     fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: u32, audio_buffer_seconds: u32) {
         let {mut input_audio_buffer_producer, mut input_audio_buffer_consumer} = HeapRb::<f32>::new(buffer_seconds*input_sample_rate).split();
+        let (mut input_audio_buffer_metadata_producer, mut input_audio_buffer_metadata_consumer) = HeapRb::<AudioBufferMetadata>::new(1000); // should be plenty for any practical use
         Ok(Self {
             input_sample_rate: i128::from(input_sample_rate),
             output_sample_rate: i128::from(output_sample_rate),
             dynamic_output_sample_rate: i128::from(output_sample_rate),
             input_audio_buffer_producer: input_audio_buffer_producer,
             input_audio_buffer_consumer: input_audio_buffer_consumer,
+            input_audio_buffer_metadata_producer: input_audio_buffer_metadata_producer,
+            input_audio_buffer_metadata_consumer: input_audio_buffer_metadata_consumer,
             chunk_sizes: LocalRb::<u64>::new(history_len),
             system_time_in_frames_when_chunk_ended: LocalRb::<i128>::new(history_len),
             target_emitted_frames: AtomicU64::new(0),
@@ -975,16 +985,43 @@ impl StreamAligner {
         // use our estimate to suggest how many frames we should have emitted
         // this is used to dynamically adjust sample rate until we actually emit that many frames
         // that ensures that we stay synchronized to the system clock and do not drift
-        self.target_emitted_frames.fetch_add(self.estimate_when_most_recent_ended() * self.output_sample_rate / self.input_sample_rate, Ordering::Relaxed);
+        let metadata = AudioBufferMetadata {
+            num_frames: chunk.len() as u64,
+            target_emitted_frames: self.estimate_when_most_recent_ended() * self.output_sample_rate / self.input_sample_rate,
+        };
+        if let Err(metadata) = self.input_audio_buffer_metadata_producer.try_push(metadata) {
+            eprintln!("Error: metadata ring buffer full; dropping {:?}, this is very bad what happened", metadata);
+        }
+    }
+
+    // do it very slowly
+    fn decrease_dynamic_sample_rate() {
+        self.dynamic_output_sample_rate = max((self.output_sample_rate * 0.95) as i128, self.dynamic_output_sample_rate-1);
+    }
+
+    fn increase_dynamic_sample_rate() {
+        self.dynamic_output_sample_rate = min((self.output_sample_rate * 1.05) as i128, self.dynamic_output_sample_rate+1);
+    }
+
+    fn handle_metadata(metadata: AudioBufferMetadata) {
+        let target_emitted_frames = metadata.target_emitted_frames;
+        let num_available_frames = metadata.num_frames;
+        let estimated_emitted_frames = num_available_frames * self.dynamic_output_sample_rate / self.input_sample_rate
+        let updated_total_frames_emitted = self.total_emitted_frames + estimated_emitted_frames
+        // not enough frames, we need to increase dynamic sample rate (to get more samples)
+        if updated_total_frames_emitted < target_emitted_frames {
+            decrease_dynamic_sample_rate();
+        }
+        // too many frames, we need to decrease dynamic sample rate (to get less samples)
+        else if updated_total_frames_emitted > target_emitted_frames {
+            increase_dynamic_sample_rate();
+        }
     }
 
     fn output_chunks() {
-        let target_emitted_frames = self.target_emitted_frames.load(Ordering::Relaxed);
-        let num_available_frames = self.input_audio_buffer.occupied_len();
-        let estimated_emitted_frames = num_available_frames * self.dynamic_output_sample_rate / self.input_sample_rate
-        let updated_total_frames_emitted = self.total_emitted_frames + estimated_emitted_frames
-        if updated_total_frames_emitted < 
-
+        while let Some(meta) = self.input_audio_buffer_metadata_consumer.try_pop() {
+            handle_meta(meta);
+        }
     }
 }
 
