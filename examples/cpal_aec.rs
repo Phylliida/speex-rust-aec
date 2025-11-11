@@ -902,17 +902,22 @@ struct AudioBufferMetadata {
 
 struct StreamAligner {
     start_time: Option<std::time::Instant>,
-    input_sample_rate: i128,
-    output_sample_rate: i128,
-    dynamic_output_sample_rate: i128,
-    input_audio_buffer_producer: HeapProd<u64>,
-    input_audio_buffer_consumer: HeapCons<u64>,
+    input_sample_rate: u32,
+    output_sample_rate: u32,
+    dynamic_output_sample_rate: u32,
+    input_audio_buffer_producer: HeapProd<f32>,
+    input_audio_buffer_consumer: HeapCons<f32>,
     input_audio_buffer_metadata_producer: HeapProd<AudioBufferMetadata>,
     input_audio_buffer_metadata_consumer: HeapCons<AudioBufferMetadata>,
+    working_input_audio_buffer: Vec<f32>,
+    working_output_audio_buffer: Vec<f32>,
+    total_input_samples_remaining: u32,
+    output_audio_data_producer: HeapProd<f32>,
     chunk_sizes: LocalRb<u64>, // only accessed by the audio push thread
     system_time_in_frames_when_chunk_ended: LocalRb<i128>, // only accessed by the audio input thread
     target_emitted_frames: AtomicU64
     total_emitted_frames: AtomicU64
+    resampler: Resampler
 }
 
 
@@ -920,21 +925,31 @@ impl StreamAligner {
     // Takes input audio and resamples it to the target rate
     // May slightly stretch or squeeze the audio (via resampling)
     // to ensure the outputs stay aligned with system clock
-    fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: u32, audio_buffer_seconds: u32) {
+    fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: u32, audio_buffer_seconds: u32, resampler_quality: i32, output_audio_data_producer: HeapProd<f32>) {
         let {mut input_audio_buffer_producer, mut input_audio_buffer_consumer} = HeapRb::<f32>::new(buffer_seconds*input_sample_rate).split();
         let (mut input_audio_buffer_metadata_producer, mut input_audio_buffer_metadata_consumer) = HeapRb::<AudioBufferMetadata>::new(1000); // should be plenty for any practical use
         Ok(Self {
-            input_sample_rate: i128::from(input_sample_rate),
-            output_sample_rate: i128::from(output_sample_rate),
-            dynamic_output_sample_rate: i128::from(output_sample_rate),
+            input_sample_rate: input_sample_rate,
+            output_sample_rate: output_sample_rate,
+            dynamic_output_sample_rate: output_sample_rate,
             input_audio_buffer_producer: input_audio_buffer_producer,
             input_audio_buffer_consumer: input_audio_buffer_consumer,
             input_audio_buffer_metadata_producer: input_audio_buffer_metadata_producer,
             input_audio_buffer_metadata_consumer: input_audio_buffer_metadata_consumer,
+            output_audio_data_producer: output_audio_data_producer,
+            total_input_samples_remaining: 0,
+            working_input_audio_buffer: Vec::new(),
+            working_output_audio_buffer: Vec::new(),
             chunk_sizes: LocalRb::<u64>::new(history_len),
             system_time_in_frames_when_chunk_ended: LocalRb::<i128>::new(history_len),
             target_emitted_frames: AtomicU64::new(0),
-            total_emitted_frames: AtomicU64::new(0)
+            total_emitted_frames: AtomicU64::new(0),
+            resampler: Resampler::new(
+                output_channels as u32,
+                input_sample_rate,
+                output_sample_rate,
+                resampler_quality
+            )
         })
     }
 
@@ -970,9 +985,9 @@ impl StreamAligner {
         let recieved_timestamp = Instant::now(); // store this first so we are as precise as possible
         if let None = self.start_time {
             // choose a start time so that frames_when_chunk_ended starts out equal to chunk len
-            self.start_time = recieved_timestamp - Duration::from_micros(frames_to_micros(chunk.len()));
+            self.start_time = recieved_timestamp - Duration::from_micros(frames_to_micros(chunk.len(), i128::from(self.input_sample_rate)));
         }
-        let frames_when_chunk_ended = self.micros_to_frames(recieved_timestamp.duration_since(self.start_time).as_micros(), self.input_sample_rate);
+        let frames_when_chunk_ended = self.micros_to_frames(recieved_timestamp.duration_since(self.start_time).as_micros(), i128::from(self.input_sample_rate));
 
         let appended_count = self.input_audio_buffer_producer.push_slice(chunk);
         if appended_count < chunk.len() { // todo: auto resize
@@ -1003,6 +1018,103 @@ impl StreamAligner {
         self.dynamic_output_sample_rate = min((self.output_sample_rate * 1.05) as i128, self.dynamic_output_sample_rate+1);
     }
 
+    fn input_to_output_frames(u32 input_frames, u32 in_rate, u32 out_rate) {
+        // u64 to avoid overflow
+        return ((input_frames as u64) * (out_rate as u64) / (in_rate as u64)) as u32
+    }
+
+    fn output_to_input_frames(u32 output_frames, u32 in_rate, u32 out_rate) {
+        // u64 to avoid overflow
+        return ((output_Frames as u64) * (in_rate as u64) / (out_rate as u64)) as u32
+    }
+
+    fn resample_exact(
+        input: &mut HeapCons<f32>,
+        mut remaining: usize,
+        output: &mut HeapProd<f32>,
+        in_rate: u32,
+        out_rate: u32,
+        resampler: &mut Resampler,
+    ) -> Result<(), ResamplerError> {
+        // there might be some leftover from last call, so use global state
+        // (worst case this is like 0.6 ms or so, so it's okay to have them slightly delayed like this)
+        self.total_input_samples_remaining += remaining;
+
+        // resize if too small
+        if self.working_input_audio_buffer.capacity() < self.total_input_samples_remaining {
+            self.working_input_audio_buffer.resize(self.total_input_samples_remaining, 0.0);
+        }
+        let (input_items_up_to_end, input_items_starting_from_front) = input.as_slices();
+
+        // we can just use the latter half of ring buffer, use that and avoid any copies
+        let mut input_buf = if input_items_up_to_end.len() <= self.total_input_samples_remaining {
+            input_items_up_to_end[..self.total_input_samples_remaining]
+        }
+        // we can just use first half of ring buffer, use that and avoid any copies
+        else if input_items_up_to_end.is_empty() {
+            input_items_starting_from_front[..self.total_input_samples_remaining]
+        }
+        // we need continguous memory, use our working buffer            
+        else {
+            self.working_input_audio_buffer.clear(); // doesn't actually deallocate memory, just sets size to zero
+            let mut needed = self.total_input_samples_remaining;
+            // this goes through the top part and bottom part of ringbuffer, in order until we've eaten enough
+            for slice in [input_items_up_to_end, input_items_starting_from_front] {
+                if needed == 0 {
+                    break;
+                }
+                let take = slice.len().min(needed);
+                if take > 0 {
+                    self.working_input_audio_buffer.extend_from_slice(&slice[..take]);
+                }
+                needed -= take;
+            }
+            self.working_input_audio_buffer
+        }
+
+        let (output_items_up_to_end, output_items_starting_from_front) = output.vacant_slices_mut();
+
+        let target_output_samples_count = input_to_output_frames(self.total_input_samples_remaining, in_rate, out_rate) + 10; // add a few extra for rounding
+
+        // we can just use latter part of output ring buf, use that and avoid copies
+        let mut output_buf, use_output_prod = if output_items_up_to_end.len() >= target_output_samples_count {
+            let buf = unsafe { MaybeUninit::slice_assume_init_mut(output_items_up_to_end) };
+            buf[..target_output_samples_count], true
+        }
+        // we can use front part of ring buf, use that and avoid copies
+        else if output_items_starting_from_front.is_empty() {
+            let buf = unsafe { MaybeUninit::slice_assume_init_mut(output_items_starting_from_front) };
+            buf[..target_output_samples_count], true
+        }
+        // need to use working buffer to get contiguous output array
+        else {
+            // resize if too small
+            if self.working_output_audio_buffer.capacity() < target_output_samples_count { 
+                self.working_output_audio_buffer.resize(target_output_frame_count, 0.0);
+            }
+
+            // set the len to target output len
+            unsafe { self.working_output_audio_buffer.set_len(target_output_samples_count); }
+            self.working_output_audio_buffer, false
+        };
+
+        let (consumed, produced) = resampler.process_interleaved_f32(input_buf, output_buf)?;
+        
+        // we are already using output_prod and already wrote to it, just advance write index
+        let _appended_count = if use_output_prod {
+            unsafe { output.advance_write_index(produced) };
+            produced
+        }
+        // copy from working buffer into output producer
+        else {
+            self.output.push_slice(output_buf[..produced])
+        };
+
+        self.total_input_samples_remaining -= consumed;
+        
+        input.skip(consumed);
+    }
+
     fn handle_metadata(metadata: AudioBufferMetadata) {
         let target_emitted_frames = metadata.target_emitted_frames;
         let num_available_frames = metadata.num_frames;
@@ -1016,6 +1128,36 @@ impl StreamAligner {
         else if updated_total_frames_emitted > target_emitted_frames {
             increase_dynamic_sample_rate();
         }
+        // Code goes here. It should pop off num_available_frames from self.input_audio_buffer_consumer
+        resampler.set_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
+        
+        match self
+            .resampler
+            .process_interleaved_i16(&new_samples[offset..], &mut out[start..])
+        {
+            Ok((consumed, produced)) => {
+                out.truncate(start + produced);
+                if consumed == 0 {
+                    if produced == chunk_samples && attempts < 8 {
+                        attempts += 1;
+                        chunk_samples += self.channels.max(1) * 32;
+                        continue;
+                    }
+                    if produced == 0 {
+                        out.truncate(start);
+                    }
+                    return;
+                }
+                offset += consumed;
+                break;
+            }
+            Err(err) => {
+                out.truncate(start);
+                eprintln!("Resampler error: {err}");
+                return;
+            }
+        }
+        
     }
 
     fn output_chunks() {
