@@ -27,7 +27,7 @@ use std::{
     env,
     error::Error,
     ffi::c_void,
-    mem,
+    mem::{self, MaybeUninit},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -39,6 +39,10 @@ use cpal::{
     StreamConfig, StreamInstant, SupportedStreamConfigRange,
 };
 use hound::{self, WavSpec};
+use ringbuf::{
+    traits::{Consumer, Observer, Producer},
+    HeapCons, HeapProd, HeapRb, LocalRb,
+};
 use speex_rust_aec::{
     speex_echo_cancellation, speex_echo_ctl, EchoCanceller, Resampler, SPEEX_ECHO_SET_SAMPLING_RATE,
 };
@@ -895,8 +899,120 @@ where
     )
 }
 
-struct BufferedCircularProducer {
+/// Producer-side sibling to `BufferedCircularBuffer`.
+/// Provides chunked, mostly zero-copy write access to a `HeapProd`.
+/// Call `chunk_mut()` to obtain a contiguous region and `commit()` afterwards
+/// to advance the underlying write index (or copy scratch data in).
+struct BufferedCircularProducer<T> {
+    producer: HeapProd<T>,
+    scratch: Vec<T>,
+    pending_len: usize,
+    pending_scratch: bool,
+}
 
+impl<T> BufferedCircularProducer<T> {
+    fn new(producer: HeapProd<T>) -> Self {
+        Self {
+            producer,
+            scratch: Vec::new()
+        }
+    }
+
+    fn finish_write(&mut self, pending_scratch: bool, num_written: usize) {
+        if pending_scratch {
+            // wrote to scratch, need to add it to producer
+            let _appended = self.producer.push_slice(&self.scratch[..num_written]);
+        } else {
+            // wrote directly to producer, simply advance write index
+            unsafe { self.producer.advance_write_index(num_written) };
+        }
+    }
+}
+
+impl<T: Copy + Default> BufferedCircularProducer<T> {
+    fn get_chunk_to_write(&mut self, size: usize) -> (bool, &mut [T]) {
+        let (first, second) = self.producer.vacant_slices_mut();
+        // we can simply 
+        if first.len() >= size {
+            let buf = unsafe { MaybeUninit::slice_assume_init_mut(first) };
+            &mut buf[..size]
+        } else if first.is_empty() && second.len() >= size {
+            let buf = unsafe { MaybeUninit::slice_assume_init_mut(second) };
+            &mut buf[..size]
+        }
+        else {
+            if self.scratch.len() < size {
+                self.scratch.resize_with(size, Default::default);
+            }
+            &mut self.scratch[..size]
+        }
+    }
+}
+
+/// Helper that makes the consumer half of a ring buffer feel like a stream of contiguous slices.
+/// It tries to return zero-copy slices when the occupied region is already contiguous,
+/// and otherwise falls back to copying into a scratch buffer.
+/// `StreamAligner` can hold one of these alongside its producer half and call `chunk()` /
+/// `consume()` whenever it needs to feed the SpeexDSP resampler.
+struct BufferedCircularConsumer<T> {
+    consumer: HeapCons<T>,
+    scratch: Vec<T>,
+}
+
+impl<T> BufferedCircularConsumer<T> {
+    fn new(consumer: HeapCons<T>) -> Self {
+        Self {
+            consumer,
+            scratch: Vec::new(),
+        }
+    }
+
+    fn finish_read(&mut self, num_read: usize) -> usize {
+        self.consumer.skip(num_read)
+    }
+}
+
+impl<T: Copy> BufferedCircularConsumer<T> {
+    fn get_chunk_to_read(&mut self, size: usize) -> &[T] {
+        if size == 0 {
+            return &[];
+        }
+
+        let (head, tail) = self.consumer.as_slices();
+        let head_len = head.len();
+        let tail_len = tail.len();
+        let available = head_len + tail_len;
+        if available == 0 {
+            eprintln!("Consumer is saturated, this is bad, please increase buffer sizes")
+            return &[];
+        }
+
+        let take = size.min(available);
+        // all fits in head, just return slice of that
+        if head_len >= take {
+            &head[..take]
+        // head is empty so all fits in tail, return that
+        } else if head_len == 0 {
+            &tail[..take]
+        // we need intermediate buffer to join head and tail, use scratch
+        } else {
+            if self.scratch.capacity() < needed {
+                self.scratch.reserve(needed - self.scratch.capacity());
+            }
+            self.scratch.clear(); // this empties it but does not remove allocations
+
+            let from_head = head_len.min(take);
+            if from_head > 0 {
+                self.scratch.extend_from_slice(&head[..from_head]);
+            }
+            let remaining = take - from_head;
+            if remaining > 0 {
+                self.scratch.extend_from_slice(&tail[..remaining]);
+            }
+
+            &self.scratch[..take]
+        }
+    }
 }
 
 struct AudioBufferMetadata {
@@ -1131,39 +1247,13 @@ impl StreamAligner {
         let updated_total_frames_emitted = self.total_emitted_frames + estimated_emitted_frames
         // not enough frames, we need to increase dynamic sample rate (to get more samples)
         if updated_total_frames_emitted < target_emitted_frames {
-            decrease_dynamic_sample_rate();
+            self.decrease_dynamic_sample_rate();
         }
         // too many frames, we need to decrease dynamic sample rate (to get less samples)
         else if updated_total_frames_emitted > target_emitted_frames {
-            increase_dynamic_sample_rate();
+            self.increase_dynamic_sample_rate();
         }
-        
-        match self
-            .resampler
-            .process_interleaved_i16(&new_samples[offset..], &mut out[start..])
-        {
-            Ok((consumed, produced)) => {
-                out.truncate(start + produced);
-                if consumed == 0 {
-                    if produced == chunk_samples && attempts < 8 {
-                        attempts += 1;
-                        chunk_samples += self.channels.max(1) * 32;
-                        continue;
-                    }
-                    if produced == 0 {
-                        out.truncate(start);
-                    }
-                    return;
-                }
-                offset += consumed;
-                break;
-            }
-            Err(err) => {
-                out.truncate(start);
-                eprintln!("Resampler error: {err}");
-                return;
-            }
-        }
+        self.resample
         
     }
 
