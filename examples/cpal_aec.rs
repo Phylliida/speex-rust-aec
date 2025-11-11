@@ -1042,7 +1042,6 @@ struct StreamAligner {
     resampler: Resampler
 }
 
-
 impl StreamAligner {
     // Takes input audio and resamples it to the target rate
     // May slightly stretch or squeeze the audio (via resampling)
@@ -1050,18 +1049,19 @@ impl StreamAligner {
     fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: u32, audio_buffer_seconds: u32, resampler_quality: i32, output_audio_data_producer: HeapProd<f32>) {
         let {mut input_audio_buffer_producer, mut input_audio_buffer_consumer} = HeapRb::<f32>::new(buffer_seconds*input_sample_rate).split();
         let (mut input_audio_buffer_metadata_producer, mut input_audio_buffer_metadata_consumer) = HeapRb::<AudioBufferMetadata>::new(1000); // should be plenty for any practical use
-        let (mut output_audio_buffer_producer, mut output_audio_buffer_consumer) = HeapRb::<f32>::new(buffer_seconds*output_sample_rate).split();
         Ok(Self {
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
             dynamic_output_sample_rate: output_sample_rate,
             input_audio_buffer_producer: input_audio_buffer_producer,
+            // we need buffered because this interfaces with speex which expects continuous buffers
             input_audio_buffer_consumer: BufferedCircularConsumer::<f32>::new(input_audio_buffer_consumer),
             input_audio_buffer_metadata_producer: input_audio_buffer_metadata_producer,
             input_audio_buffer_metadata_consumer: input_audio_buffer_metadata_consumer,
+            // these are also buffered because speex also needs continuous buffers to output to
             output_audio_buffer_producer: BufferedCircularProducer::<f32>::new(output_audio_buffer_producer),
-            output_audio_buffer_consumer: BufferedCircularProducer::<f32>::new(output_audio_buffer_consumer),
-            total_input_samples_remaining: 0,
+            total_input_samples_remaining: 0, // variable to accumulate bc speex goes in chunks
+            // alignment data, these are used to adjust resample rate so output stays aligned with true timings (according to sytem clock)
             chunk_sizes: LocalRb::<u64>::new(history_len),
             system_time_in_frames_when_chunk_ended: LocalRb::<i128>::new(history_len),
             target_emitted_frames: AtomicU64::new(0),
@@ -1103,7 +1103,7 @@ impl StreamAligner {
         return best_estimate_of_when_most_recent_ended
     }
 
-    fn process_chunk(chunk: &[f32]) {
+    fn process_chunk(&mut self, chunk: &[f32]) {
         let recieved_timestamp = Instant::now(); // store this first so we are as precise as possible
         if let None = self.start_time {
             // choose a start time so that frames_when_chunk_ended starts out equal to chunk len
