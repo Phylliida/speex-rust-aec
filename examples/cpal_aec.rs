@@ -40,12 +40,18 @@ use cpal::{
 };
 use hound::{self, WavSpec};
 use ringbuf::{
-    traits::{Consumer, Observer, Producer},
+    traits::{Consumer, Observer, Producer, RingBuffer},
     HeapCons, HeapProd, HeapRb, LocalRb,
 };
 use speex_rust_aec::{
     speex_echo_cancellation, speex_echo_ctl, EchoCanceller, Resampler, SPEEX_ECHO_SET_SAMPLING_RATE,
 };
+
+use std::time::Instant;
+
+use std::cmp::max;
+use std::cmp::min;
+
 
 const DEFAULT_AEC_RATE: u32 = 48_000;
 const RESAMPLER_QUALITY: i32 = 5;
@@ -983,7 +989,7 @@ impl<T: Copy> BufferedCircularConsumer<T> {
         let tail_len = tail.len();
         let available = head_len + tail_len;
         if available == 0 {
-            eprintln!("Consumer is saturated, this is bad, please increase buffer sizes")
+            eprintln!("Consumer is saturated, this is bad, please increase buffer sizes");
             return &[];
         }
 
@@ -996,8 +1002,8 @@ impl<T: Copy> BufferedCircularConsumer<T> {
             &tail[..take]
         // we need intermediate buffer to join head and tail, use scratch
         } else {
-            if self.scratch.capacity() < needed {
-                self.scratch.reserve(needed - self.scratch.capacity());
+            if self.scratch.capacity() < take {
+                self.scratch.reserve(take - self.scratch.capacity());
             }
             self.scratch.clear(); // this empties it but does not remove allocations
 
@@ -1038,19 +1044,17 @@ struct StreamAligner {
     output_audio_data_producer: HeapProd<f32>,
     chunk_sizes: LocalRb<u64>, // only accessed by the audio push thread
     system_time_in_frames_when_chunk_ended: LocalRb<i128>, // only accessed by the audio input thread
-    target_emitted_frames: AtomicU64
-    total_emitted_frames: AtomicU64
     resampler: Resampler
 }
 
-fn input_to_output_frames(i128 input_frames, u32 in_rate, u32 out_rate) -> i128 {
+fn input_to_output_frames(input_frames: i128, in_rate: u32, out_rate: u32) -> i128 {
     // u128 to avoid overflow
     return (((input_frames as i128) * (out_rate as i128)) / (in_rate as i128)) as i128
 }
 
-fn output_to_input_frames(i128 output_frames, u32 in_rate, u32 out_rate) -> i128 {
+fn output_to_input_frames(output_frames: i128, in_rate: u32, out_rate: u32) -> i128 {
     // u128 to avoid overflow
-    return (((output_Frames as i128) * (in_rate as i128)) / (out_rate fas i128)) as i128
+    return (((output_frames as i128) * (in_rate as i128)) / (out_rate as i128)) as i128
 }
 
 fn micros_to_frames(microseconds: i128, sample_rate: i128) -> i128 {
@@ -1072,8 +1076,8 @@ impl StreamAligner {
     // Takes input audio and resamples it to the target rate
     // May slightly stretch or squeeze the audio (via resampling)
     // to ensure the outputs stay aligned with system clock
-    fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: u32, audio_buffer_seconds: u32, resampler_quality: i32, output_audio_data_producer: HeapProd<f32>) {
-        let {mut input_audio_buffer_producer, mut input_audio_buffer_consumer} = HeapRb::<f32>::new(buffer_seconds*input_sample_rate).split();
+    fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: u32, audio_buffer_seconds: u32, resampler_quality: i32, output_audio_buffer_producer: HeapProd<f32>) {
+        let (mut input_audio_buffer_producer, mut input_audio_buffer_consumer) = HeapRb::<f32>::new(audio_buffer_seconds * input_sample_rate).split();
         let (mut input_audio_buffer_metadata_producer, mut input_audio_buffer_metadata_consumer) = HeapRb::<AudioBufferMetadata>::new(1000); // should be plenty for any practical use
         Ok(Self {
             input_sample_rate: input_sample_rate,
@@ -1091,10 +1095,8 @@ impl StreamAligner {
             start_time: None,
             chunk_sizes: LocalRb::<u64>::new(history_len),
             system_time_in_frames_when_chunk_ended: LocalRb::<i128>::new(history_len),
-            target_emitted_frames: AtomicU64::new(0),
-            total_emitted_frames: AtomicU64::new(0),
             resampler: Resampler::new(
-                output_channels as u32,
+                1, // channels, we have one of these for each channel
                 input_sample_rate,
                 output_sample_rate,
                 resampler_quality
@@ -1110,10 +1112,10 @@ impl StreamAligner {
         // (btw, CPAL timestamps do not work because they may be different for different devices)
         // (wheras this synchronizes us to global system time)
         let best_estimate_of_when_most_recent_ended = self.system_time_in_frames_when_chunk_ended.first();
-        for chunk_size, frames_when_chunk_ended in self.chunk_sizes.iter().zip(self.system_time_in_frames_when_chunk_ended.iter(), self.chunk_cpal_capture_times.iter()) {
-            best_estimate_of_when_most_recent_ended = min(frames_when_chunk_ended, best_estimate_of_when_most_recent_ended+chunk_size)
+        for (chunk_size, frames_when_chunk_ended) in self.chunk_sizes.iter().zip(self.system_time_in_frames_when_chunk_ended.iter(), self.chunk_cpal_capture_times.iter()) {
+            best_estimate_of_when_most_recent_ended = min(frames_when_chunk_ended, best_estimate_of_when_most_recent_ended+chunk_size);
         }
-        return best_estimate_of_when_most_recent_ended
+        best_estimate_of_when_most_recent_ended
     }
 
     fn process_chunk(&mut self, chunk: &[f32]) {
@@ -1146,18 +1148,18 @@ impl StreamAligner {
 
     // do it very slowly
     fn decrease_dynamic_sample_rate(&mut self) {
-        self.dynamic_output_sample_rate = max(((self.output_sample_rate as float) * 0.95) as i128, self.dynamic_output_sample_rate-1);
+        self.dynamic_output_sample_rate = max(((self.output_sample_rate as f32) * 0.95) as i128, self.dynamic_output_sample_rate-1);
     }
 
     fn increase_dynamic_sample_rate(&mut self) {
-        self.dynamic_output_sample_rate = min(((self.output_sample_rate as float) * 1.05) as i128, self.dynamic_output_sample_rate+1);
+        self.dynamic_output_sample_rate = min(((self.output_sample_rate as f32) * 1.05) as i128, self.dynamic_output_sample_rate+1);
     }
 
     fn handle_metadata(&mut self, metadata: AudioBufferMetadata) -> Result<(), Box<dyn std::error::Error>> {
         let target_emitted_frames = metadata.target_emitted_frames;
         let num_available_frames = metadata.num_frames;
         let estimated_emitted_frames = input_to_output_frames(num_available_frames, self.input_sample_rate, self.dynamic_output_sample_rate);
-        let updated_total_frames_emitted = self.total_emitted_frames + estimated_emitted_frames
+        let updated_total_frames_emitted = self.total_emitted_frames + estimated_emitted_frames;
         // not enough frames, we need to increase dynamic sample rate (to get more samples)
         if updated_total_frames_emitted < target_emitted_frames {
             self.decrease_dynamic_sample_rate();
@@ -1171,17 +1173,17 @@ impl StreamAligner {
         self.resampler.set_rate(self.input_sample_rate, self.dynamic_output_sample_rate)?;
 
         // there might be some leftover from last call, so use global state
-        self.total_input_samples_remaining += remaining;
+        self.total_input_samples_remaining += num_available_frames;
 
-        let input_buf = self.input_audio_buffer_consumer.get_chunk_to_read(self.total_input_samples_remaining as usize)
+        let input_buf = self.input_audio_buffer_consumer.get_chunk_to_read(self.total_input_samples_remaining as usize);
         let target_output_samples_count = input_to_output_frames(self.total_input_samples_remaining, self.input_sample_rate, self.dynamic_output_sample_rate) + 10; // add a few extra for rounding
         let (need_to_write_outputs, mut output_buf) = self.output_audio_buffer_producer.get_chunk_to_write(target_output_samples_count as usize);
         let (consumed, produced) = self.resampler.process_interleaved_f32(input_buf, output_buf)?;
         // it may return less consumed and produced than the sizes of stuff we gave it
         // so use actual processed sizes here instead of our lengths from above
         // (worst case this is like 0.6 ms or so, so it's okay to have them slightly delayed like this)
-        self.input_audio_buffer_consumer.finish_read(consumed)
-        self.output_audio_buffer_producer.finish_write(need_to_write_outputs, produced)
+        self.input_audio_buffer_consumer.finish_read(consumed);
+        self.output_audio_buffer_producer.finish_write(need_to_write_outputs, produced);
 
         // update our total
         self.total_input_samples_remaining -= consumed as u64;
@@ -1200,7 +1202,7 @@ impl StreamAligner {
     }
 }
 
-
+/*
 struct SharedAecStream {
     shared: Arc<Mutex<SharedCanceller>>,
     playback: Arc<Mutex<PlaybackBuffer>>,
@@ -1230,7 +1232,6 @@ impl SharedAecStream {
         let output_channels = output_config.channels as usize;
         let input_rate = input_config.sample_rate.0;
         let output_rate = output_config.sample_rate.0;
-        self.start_time = Instant::now();
 
 
         let mut input_resampler = if input_rate != target_sample_rate {
@@ -1485,6 +1486,7 @@ impl Drop for SharedAecStream {
         self.flush_resamplers();
     }
 }
+*/
 
 fn select_device<I>(
     devices: Result<I, cpal::DevicesError>,
