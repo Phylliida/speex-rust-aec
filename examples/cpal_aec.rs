@@ -945,16 +945,16 @@ impl<T: Copy + Default> BufferedCircularProducer<T> {
         // we can simply 
         if first.len() >= size {
             let buf = unsafe { assume_init_slice_mut(first) };
-            (true, &mut buf[..size])
+            (false, &mut buf[..size])
         } else if first.is_empty() && second.len() >= size {
             let buf = unsafe { assume_init_slice_mut(second) };
-            (true, &mut buf[..size])
+            (false, &mut buf[..size])
         }
         else {
             if self.scratch.len() < size {
                 self.scratch.resize_with(size, Default::default);
             }
-            (false, &mut self.scratch[..size])
+            (true, &mut self.scratch[..size])
         }
     }
 }
