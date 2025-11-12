@@ -1098,7 +1098,7 @@ impl StreamAligner {
             chunk_sizes: LocalRb::<Heap<usize>>::new(history_len),
             system_time_in_frames_when_chunk_ended: LocalRb::<Heap<i128>>::new(history_len),
             resampler: Resampler::new(
-                1, // channels, we have one of these for each channel
+                1, // channels, we have one of these StreamAligner each channel
                 input_sample_rate,
                 output_sample_rate,
                 resampler_quality
@@ -1144,20 +1144,22 @@ impl StreamAligner {
         if appended_count < chunk.len() { // todo: auto resize
             eprintln!("Error: cannot keep up with audio, buffer is full, try increasing audio_buffer_seconds")
         }
-        // delibrately overwrite once we pass history len, we keep a rolling buffer of last 100 or so
-        self.chunk_sizes.push_overwrite(chunk.len());
-        self.system_time_in_frames_when_chunk_ended.push_overwrite(frames_when_chunk_ended);
+        if appended_count > 0 {
+            // delibrately overwrite once we pass history len, we keep a rolling buffer of last 100 or so
+            self.chunk_sizes.push_overwrite(appended_count);
+            self.system_time_in_frames_when_chunk_ended.push_overwrite(frames_when_chunk_ended);
 
-        // use our estimate to suggest how many frames we should have emitted
-        // this is used to dynamically adjust sample rate until we actually emit that many frames
-        // that ensures that we stay synchronized to the system clock and do not drift
-        let most_recent_ended_estimate = self.estimate_when_most_recent_ended();
-        let metadata = AudioBufferMetadata {
-            num_frames: chunk.len() as u64,
-            target_emitted_frames: input_to_output_frames(most_recent_ended_estimate, self.input_sample_rate, self.output_sample_rate)
-        };
-        if let Err(metadata) = self.input_audio_buffer_metadata_producer.try_push(metadata) {
-            eprintln!("Error: metadata ring buffer full; dropping {:?}, this is very bad what happened", metadata);
+            // use our estimate to suggest how many frames we should have emitted
+            // this is used to dynamically adjust sample rate until we actually emit that many frames
+            // that ensures that we stay synchronized to the system clock and do not drift
+            let most_recent_ended_estimate = self.estimate_when_most_recent_ended();
+            let metadata = AudioBufferMetadata {
+                num_frames: chunk.len() as u64,
+                target_emitted_frames: input_to_output_frames(most_recent_ended_estimate, self.input_sample_rate, self.output_sample_rate)
+            };
+            if let Err(metadata) = self.input_audio_buffer_metadata_producer.try_push(metadata) {
+                eprintln!("Error: metadata ring buffer full; dropping {:?}, this is very bad what happened", metadata);
+            }
         }
     }
 
@@ -1211,7 +1213,7 @@ impl StreamAligner {
 
     fn output_chunks(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         while let Some(meta) = self.input_audio_buffer_metadata_consumer.try_pop() {
-            self.handle_metadata(meta);
+            self.handle_metadata(meta)?;
         }
         Ok(())
     }
