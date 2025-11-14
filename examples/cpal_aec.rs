@@ -1476,6 +1476,19 @@ fn get_input_stream_aligners(device_config: InputDeviceConfig, aec_config: AecCo
     return (stream, aligners);
 }
 
+struct AecStream {
+    aec: Option<EchoCanceller>,
+    aec_config: AecConfig,
+    input_streams: HashMap<String, Stream>
+    output_streams: HashMap<String, Stream>
+    input_aligners: HashMap<String, Vec<InputStreamAligner>>,
+    output_aligners: HashMap<String, Vec<OutputStreamAligner>>,
+    sorted_input_aligners: Vec<&String>,
+    sorted_output_aligners: Vec<&String>,
+    input_channels: usize,
+    output_channels: usize
+}
+
 impl AecStream {
     fn new(
         aec_config: AecConfig
@@ -1486,78 +1499,91 @@ impl AecStream {
 
         return Ok(Self {
            aec_config: aec_config,
-           input_aligners: Vec::new(),
-           output_aligners: Vec::new(),
-           aec:  
+           input_streams: HashMap::new(),
+           output_streams: HashMap::new(),
+           input_aligners: HashMap::new(),
+           output_aligners: HashMap::new(),
+           input_channels: 0,
+           output_channels: 0,
         })
-
-        self.aec_config = aec_config
-        self.input_aligners = Vec::new();
-        self.output_aigners = 
     }
 
-    fn add_input_device(config: InputDeviceConfig) {
+    fn num_input_channels(&self) {
+        self.input_aligners.values().flatten().count()
+    }
 
+    fn num_output_aligners(&self) {
+        self.output_aligners.values().flatten().count()
+    }
+
+    fn reinitialize_aec(&mut self) {
+        self.input_channels = self.num_input_channels();
+        self.output_channels = self.num_output_channels();
+
+        // store a consistent ordering
+        self.sorted_input_aligners = self.input_aligners.keys().collect();
+        self.sorted_input_aligners.sort();
+
+        self.sorted_output_aligners = self.output_aligners.keys().collect();
+        self.sorted_output_aligners.sort();
+
+        self.aec = Some(EchoCanceller::new_multichannel(
+            frame_size: self.aec_config.frame_size,
+            filter_length: self.aec_config.filter_length,
+            mic_channels: self.input_channels,
+            speaker_channels: self.output_channels,
+        ))
+    }
+
+    fn update_aec(&self) {
+        if self.num_input_channels() != self.input_channels || self.num_output_channels() != self.output_channels {
+            self.reinitialize_aec();
+        }
+    }
+
+    fn add_input_device(&mut self, config: InputDeviceConfig) {
+        let (stream, aligners) = get_input_stream_aligners(config, self.aec_config);
+        if let Some(stream) = self.input_streams.get(config.name) {
+            stream.pause()?;
+        }
+        self.input_streams.set(config.name, stream);
+        self.input_aligners.set(config.name, aligners);
+
+        self.update_aec();
     }
 
     fn add_output_device(config: OutputDeviceConfig) {
+        let (stream, aligners) = get_output_stream_aligners(config, self.aec_config);
+        if let Some(stream) = self.output_streams.get(config.name) {
+            stream.pause()?;
+        }
+        self.output_streams.set(config.name, stream);
+        self.output_aligners.set(config.name, aligners);
 
+        self.update_aec();
     }
 
+    fn remove_input_device(&mut self, config: InputDeviceConfig) {
+        self.input_streams.remove(config.name);
+        self.input_aligners.remove(config.name);
+
+        self.update_aec();
+    }
+
+    fn remove_output_device(&mut self, config: OutputDeviceConfig) {
+        self.input_streams.remove(config.name);
+        self.input_aligners.remove(config.name);
+
+        self.update_aec();
+    }
+
+    fn update() {
+        // todo: grab the buffers from stream aligners, feed them to aec, the send them back as outputs
+        for input_key in self.sorted_input_aligners {
+        }
+    }
+}
     
-        
-        let input_aligners = Vec::new();
-        for (stream, aligners) in input_devices.iter().map(|&input_device| get_input_stream_aligners(input_device, aec_config)) {
-            input_aligners.extend(aligners);
-        }
-
-        let output_aligners = Vec::new();
-        for (stream, aligners) in output_devices.iter().map(|&output_device| get_output_stream_aligners(output_device, aec_config)) {
-            output_aligners.extend(aligners);
-        }
-
-
-        let input_aligners = input_devices.iter().flat_map(|&input_device| get_input_stream_aligners(input_device, config)).collect(); 
-        let output_aligners = output_devices.iter().flat_map(|&output_device| get_output_stream_aligners(output_device, config)).collect();
-
-        // These parameters will be reintroduced when the canceller plumbing is wired up.
-        let _ = (frame_size, filter_length);
-
-        let mut input_streams = Vec::with_capacity(input_devices.len());
-        let mut input_channels = Vec::new();
-
-        for (device_index, descriptor) in input_devices.iter().enumerate() {
-            let requested_name = descriptor.device_name.as_str();
-            let device = select_device(
-                host.input_devices(),
-                requested_name,
-                "Input",
-            )?;
-            let device_name = device
-                .name()
-                .unwrap_or_else(|_| requested_name.to_string());
-
-            validate_device_stream_config(
-                &device,
-                &device_name,
-                descriptor.config.channels,
-                descriptor.config.sample_rate.0,
-                descriptor.sample_format,
-                "input",
-            )?;
-
-            let stream_config = &descriptor.config;
-            let sample_format = descriptor.sample_format;
-            let input_rate = stream_config.sample_rate.0;
-            let channels = stream_config.channels as usize;
-
-            if channels == 0 {
-                return Err(format!(
-                    "Input device '{device_name}' reports zero channels; cannot create StreamAligner."
-                )
-                .into());
-            }
-
 
 
 fn main() -> Result<(), Box<dyn Error>> {
