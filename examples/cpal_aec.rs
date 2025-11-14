@@ -29,7 +29,12 @@ use std::{
     ffi::c_void,
     mem::{self, MaybeUninit},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, TryRecvError},
+        Arc,
+        Mutex,
+    },
     time::Duration,
 };
 
@@ -61,14 +66,17 @@ const STREAM_ALIGNER_OUTPUT_BUFFER_SECONDS: u32 = 2;
 
 type AecCallback = Box<dyn FnMut(&[i16]) + Send + 'static>;
 
-struct ResampleContext {
-    resampler: Resampler,
-    channels: usize,
-}
+
 
 #[inline]
 unsafe fn assume_init_slice_mut<T>(slice: &mut [MaybeUninit<T>]) -> &mut [T] {
     &mut *(slice as *mut [MaybeUninit<T>] as *mut [T])
+}
+
+/*
+struct ResampleContext {
+    resampler: Resampler,
+    channels: usize,
 }
 
 impl ResampleContext {
@@ -923,6 +931,16 @@ where
     )
 }
 
+
+*/
+
+
+
+
+
+
+
+
 /// Producer-side sibling to `BufferedCircularProducer`.
 /// Provides chunked, mostly zero-copy write access to a `HeapProd`.
 /// Call `chunk_mut()` to obtain a contiguous region and `commit()` afterwards
@@ -945,7 +963,7 @@ impl<T: Copy> BufferedCircularProducer<T> {
             // wrote to scratch, need to add it to producer
             let _appended = self.producer.push_slice(&self.scratch[..num_written]);
             if (_appended < num_written) {
-                eprintln("Warning: Producer cannot keep up, increase buffer size or decrease latency")
+                eprintln!("Warning: Producer cannot keep up, increase buffer size or decrease latency")
             }
         } else {
             // wrote directly to producer, simply advance write index
@@ -1237,7 +1255,7 @@ impl InputStreamAligner {
 type StreamId = u64;
 
 enum HeapConsSendMsg {
-    Add(StreamId, ringbuf::HeapProd<f32>),
+    Add(StreamId, ringbuf::HeapCons<f32>),
     Remove(StreamId),
 }
 
@@ -1284,7 +1302,7 @@ impl OutputStreamAligner {
     fn begin_audio_stream(&self, audio_buffer_seconds: usize) -> (StreamId, HeapProd<f32>) {
         // this assigns unique ids in a thread-safe way
         let stream_index = self.cur_stream_id.fetch_add(1, Ordering::Relaxed);
-        let (producer, consumer) = HeapRb::<f32>::new((audio_buffer_seconds * self.input_sample_rate) as usize).split();
+        let (producer, consumer) = HeapRb::<f32>::new((audio_buffer_seconds * (self.input_sample_rate as usize)) as usize).split();
         // send the consumer to the consume thread
         self.heap_cons_sender.send(HeapConsSendMsg::Add(stream_index, consumer)).unwrap();
         (stream_index, producer)
@@ -1333,7 +1351,7 @@ impl OutputStreamAligner {
                 *dst += src;
             }
             
-            cons.finish_read(buf_from_stream.len());
+            cons.finish_read(samples_to_mix);
         }
         self.input_audio_buffer_producer.finish_write(need_to_write_input_values, actual_input_chunk_size);
         let input_buf_read = self.input_audio_buffer_consumer.get_chunk_to_read(input_chunk_size);
@@ -1345,11 +1363,16 @@ impl OutputStreamAligner {
         // (worst case this is like 0.6 ms or so, so it's okay to have them slightly delayed like this)
         self.input_audio_buffer_consumer.finish_read(consumed);
         self.output_audio_buffer_producer.finish_write(need_to_write_output_values, produced);
+
+        Ok(())
     }
 }
 
 
-
+fn main() -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+/*
 struct InputChannelState {
     device_index: usize,
     channel_index: usize,
@@ -1723,3 +1746,4 @@ where
         .into())
     }
 }
+*/
