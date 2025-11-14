@@ -41,7 +41,7 @@ use std::{
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, FromSample, Host, InputCallbackInfo, Sample, SampleFormat, SampleRate, SizedSample,
-    Stream, StreamConfig, StreamInstant, SupportedStreamConfigRange,
+    Stream, StreamConfig, StreamInstant, SupportedStreamConfig, SupportedStreamConfigRange,
 };
 use hound::{self, WavSpec};
 use ringbuf::{
@@ -1437,21 +1437,21 @@ struct AecConfig {
 }
 
 
-fn get_input_stream_aligners(device_config: InputDeviceConfig, aec_config: AecConfig) {
-    let requested_name = descriptor.device_name.as_str();
+fn get_input_stream_aligners(device_config: InputDeviceConfig, aec_config: AecConfig) -> (Stream, Vec<InputStreamAligner>) {
+
     let device = select_device(
         device_config.host.input_devices(),
         device_config.name,
         "Input",
     )?;
 
-    check_device_settings_are_valid(
+    let supported_config = find_matching_device_config(
         &device,
         device_config.name,
         device_config.channels,
         device_config.sample_rate,
         device_config.sample_format,
-        "input",
+        "Input",
     )?;
     
     let mut aligners = Vec::new();
@@ -1463,25 +1463,59 @@ fn get_input_stream_aligners(device_config: InputDeviceConfig, aec_config: AecCo
             audio_buffer_seconds: device_config.audio_buffer_seconds,
             resampler_quality: device_config.resampler_quality,
         );
-        aligners.push();
+        aligners.push(aligner);
     }
 
-    build_input_alignment_stream(
+    let stream = build_input_alignment_stream(
         device: device,
         config: device_config,
+        supported_config: supported_config,
         aligners: aligners,
     )
+
+    return (stream, aligners);
 }
 
 impl AecStream {
     fn new(
-        input_devices: &[InputDeviceConfig],
-        output_devices: &[OutputDeviceConfig],
-        config: AecConfig
+        aec_config: AecConfig
     ) -> Result<Self, Box<dyn Error>> {
         if target_sample_rate < 0 {
             return Err("Target sample rate is {}, it must be greater than zero.".into(), target_sample_rate);
         }
+
+        return Ok(Self {
+           aec_config: aec_config,
+           input_aligners: Vec::new(),
+           output_aligners: Vec::new(),
+           aec:  
+        })
+
+        self.aec_config = aec_config
+        self.input_aligners = Vec::new();
+        self.output_aigners = 
+    }
+
+    fn add_input_device(config: InputDeviceConfig) {
+
+    }
+
+    fn add_output_device(config: OutputDeviceConfig) {
+
+    }
+
+    
+        
+        let input_aligners = Vec::new();
+        for (stream, aligners) in input_devices.iter().map(|&input_device| get_input_stream_aligners(input_device, aec_config)) {
+            input_aligners.extend(aligners);
+        }
+
+        let output_aligners = Vec::new();
+        for (stream, aligners) in output_devices.iter().map(|&output_device| get_output_stream_aligners(output_device, aec_config)) {
+            output_aligners.extend(aligners);
+        }
+
 
         let input_aligners = input_devices.iter().flat_map(|&input_device| get_input_stream_aligners(input_device, config)).collect(); 
         let output_aligners = output_devices.iter().flat_map(|&output_device| get_output_stream_aligners(output_device, config)).collect();
@@ -1562,18 +1596,18 @@ fn select_device(
     }
 }
 
-fn check_device_settings_are_valid(
+fn find_matching_device_config(
     device: &Device,
     device_name: &str,
     channels: u16,
     sample_rate: u32,
     format: SampleFormat,
     direction: &'static str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<SupportedStreamConfig, Box<dyn Error>> {
     let configs = match direction {
-        "input" => device.supported_input_configs().map(|configs| configs.collect())
+        "Input" => device.supported_input_configs().map(|configs| configs.collect())
             .map_err(|err| format!("Unable to enumerate input configs for '{device_name}': {err}"))?,
-        "output" => device.supported_output_configs().map(|configs| configs.collect())
+        "Output" => device.supported_output_configs().map(|configs| configs.collect())
             .map_err(|err| format!("Unable to enumerate output configs for '{device_name}': {err}"))?,
         other => {
             return Err(format!("Unknown device direction '{other}' when validating {device_name}., should be input or output").into());
@@ -1589,13 +1623,13 @@ fn check_device_settings_are_valid(
     }
 
     let desired_rate = SampleRate(sample_rate);
-    let supports_rate = configs
+    let matching_config = configs
         .iter()
         .filter(|cfg| cfg.channels() == channels && cfg.sample_format() == format)
-        .any(|cfg| cfg.clone().try_with_sample_rate(desired_rate).is_some());
+        .find_map(|cfg| cfg.clone().try_with_sample_rate(desired_rate));
     
-    if supports_rate {
-        Ok(())
+    if let Some(config) = matching_config {
+        Ok(config)
     } else {
         let supported_list = configs
             .iter()
@@ -1629,6 +1663,7 @@ fn check_device_settings_are_valid(
 fn build_input_alignment_stream(
     device: &Device,
     config: InputDeviceConfig,
+    supported_config: SupportedStreamConfig,
     channel_aligners: Vec<StreamAligner>,
 ) -> Result<Stream, cpal::BuildStreamError> {
     let label = device_name.to_string();
@@ -1636,16 +1671,19 @@ fn build_input_alignment_stream(
         SampleFormat::I16 => build_input_alignment_stream_typed::<i16>(
             device,
             config,
+            supported_config,
             channel_aligners,
         ),
         SampleFormat::F32 => build_input_alignment_stream_typed::<f32>(
             device,
             config,
+            supported_config,
             channel_aligners,
         ),
         SampleFormat::U16 => build_input_alignment_stream_typed::<u16>(
             device,
             config,
+            supported_config,
             channel_aligners,
         ),
         other => {
@@ -1659,7 +1697,8 @@ fn build_input_alignment_stream(
 
 fn build_input_alignment_stream_typed<T>(
     device: &Device,
-    config: InputDeviceConfig,,
+    config: InputDeviceConfig,
+    supported_config: SupportedStreamConfig,
     channel_aligners: Vec<StreamAligner>,
 ) -> Result<Stream, cpal::BuildStreamError>
 where
@@ -1674,7 +1713,7 @@ where
         .collect::<Vec<_>>();
     
     device.build_input_stream(
-        config,
+        supported_config,
         move |data: &[T], _info: &InputCallbackInfo| {
             if data.is_empty() {
                 return;
@@ -1683,7 +1722,7 @@ where
                 buffer.clear();
             }
             // undo the interleaving and convert to f32
-            for frame in data.chunks(channels) {
+            for frame in data.chunks(config.channels) {
                 for (channel_idx, sample) in frame.iter().enumerate() {
                     if let Some(buffer) = channel_buffers.get_mut(channel_idx) {
                         buffer.push(f32::from_sample(*sample));
