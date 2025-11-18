@@ -1088,26 +1088,30 @@ impl<T: Copy> BufferedCircularConsumer<T> {
     }
 }
 
+
 // a wrapper around BufferedCircularConsumer that resamples the stream before outputting
 // you must call .resample(...)? before calling get_chunk_to_read() or there will be nothing available
 // a safe choice is .resample(consumer.available_to_resample())
-struct ResampledBufferedCircularConsumer {
+struct ResampledBufferedCircularProducer {
     consumer: BufferedCircularConsumer<f32>,
     resampled_producer: BufferedCircularProducer<f32>,
-    resampled_consumer: BufferedCircularConsumer<f32>,
     input_sample_rate: u32,
     output_sample_rate: u32,
     total_input_samples_remaining: i128,
     resampler: Resampler
 }
 
-impl ResampledBufferedCircularConsumer {
-    fn new(input_sample_rate: u32, output_sample_rate : u32, resampler_quality: i32, audio_buffer_seconds: u32, consumer: BufferedCircularConsumer<f32>) -> Result<Self, Box<dyn std::error::Error>> {
-        let (resampled_producer, resampled_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
+impl ResampledBufferedCircularProducer {
+    fn new(
+        input_sample_rate: u32,
+        output_sample_rate : u32,
+        resampler_quality: i32,
+        audio_buffer_seconds: u32,
+        consumer: BufferedCircularConsumer<f32>,
+        resampled_producer: BufferedCircularProducer<f32>) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             consumer: consumer,
-            resampled_producer: BufferedCircularProducer::<f32>::new(resampled_producer),
-            resampled_consumer: BufferedCircularConsumer::<f32>::new(resampled_consumer),
+            resampled_producer: resampled_producer,
             total_input_samples_remaining: 0,
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
@@ -1140,7 +1144,7 @@ impl ResampledBufferedCircularConsumer {
     }
 }
 
-impl ResampledBufferedCircularConsumer {
+impl ResampledBufferedCircularProducer {
     // resample all data available
     fn resample_all(&mut self) -> Result<(usize, usize), Box<dyn std::error::Error>>  {
         self.resample(self.available_to_resample() as u32)
@@ -1166,16 +1170,11 @@ impl ResampledBufferedCircularConsumer {
         self.total_input_samples_remaining -= consumed as i128;
         Ok((consumed, produced))
     }
-
-    fn get_chunk_to_read(&mut self, size: usize) -> &[f32] {
-        self.resampled_consumer.get_chunk_to_read(size)
-    }
 }
 
-#[derive(Debug)]
-struct AudioBufferMetadata {
-    num_frames: u64,
-    target_emitted_frames: i128
+enum AudioBufferMetadata {
+    Arrive(u64, i128),
+    Teardown(),
 }
 
 
@@ -1222,7 +1221,7 @@ impl InputStreamAlignerProducer {
         best_estimate_of_when_most_recent_ended
     }
 
-    fn process_chunk(&mut self, chunk: &[f32]) {
+    fn process_chunk(&mut self, chunk: &[f32]) -> Result<(), Box<dyn Error>>   {
         let recieved_timestamp = Instant::now(); // store this first so we are as precise as possible
         let return_start_time = if let Some(start_time_value) = self.start_time {
             start_time_value
@@ -1249,46 +1248,60 @@ impl InputStreamAlignerProducer {
             // this is used to dynamically adjust sample rate until we actually emit that many frames
             // that ensures that we stay synchronized to the system clock and do not drift
             let most_recent_ended_estimate = self.estimate_when_most_recent_ended();
-            let metadata = AudioBufferMetadata {
-                num_frames: appended_count as u64,
-                target_emitted_frames: input_to_output_frames(most_recent_ended_estimate, self.input_sample_rate, self.output_sample_rate)
-            };
-            self.input_audio_buffer_metadata_producer.send(metadata).unwrap();
+            let metadata = AudioBufferMetadata::Arrive(
+                // num available frames
+                appended_count as u64,
+                // target_emitted_frames
+                input_to_output_frames(most_recent_ended_estimate, self.input_sample_rate, self.output_sample_rate)
+            );
+            self.input_audio_buffer_metadata_producer.send(metadata)?;
         }
     }
 
 }
 
 
-struct InputStreamAlignerConsumer {
+struct InputStreamAlignerResampler {
     input_sample_rate: u32,
     output_sample_rate: u32,
     dynamic_output_sample_rate: u32,
     input_audio_buffer_consumer: ResampledBufferedCircularConsumer,
     input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>,
     total_emitted_frames: i128,
+    finished_resampling_producer: mpsc::Sender<()>
 }
 
-impl InputStreamAlignerConsumer {
+impl InputStreamAlignerResampler {
     // Takes input audio and resamples it to the target rate
     // May slightly stretch or squeeze the audio (via resampling)
     // to ensure the outputs stay aligned with system clock
-    fn new(input_sample_rate: u32, output_sample_rate: u32, audio_buffer_seconds: u32, resampler_quality: i32, input_audio_buffer_consumer: HeapCons<f32>, input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>) -> Result<Self, Box<dyn Error>>  {
+    fn new(
+        input_sample_rate: u32,
+        output_sample_rate: u32,
+        audio_buffer_seconds: u32,
+        resampler_quality: i32,
+        input_audio_buffer_consumer: HeapCons<f32>,
+        input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>
+        output_audio_buffer_producer: HeapProd<f32>,
+        finished_resampling_producer: mpsc::Sender<()>
+    ) -> Result<Self, Box<dyn Error>>  {
         Ok(Self {
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
             dynamic_output_sample_rate: output_sample_rate,
             // we need buffered because this interfaces with speex which expects continuous buffers
-            input_audio_buffer_consumer: ResampledBufferedCircularConsumer::new(
+            input_audio_buffer_consumer: ResampledBufferedCircularProducer::new(
                 input_sample_rate,
                 output_sample_rate,
                 resampler_quality,
                 audio_buffer_seconds, 
-                BufferedCircularConsumer::<f32>::new(input_audio_buffer_consumer)
+                BufferedCircularConsumer::<f32>::new(input_audio_buffer_consumer),
+                BufferedCircularProducer::<f32>::new(output_audio_buffer_producer)
             )?,
             input_audio_buffer_metadata_consumer: input_audio_buffer_metadata_consumer,
             // alignment data, these are used to adjust resample rate so output stays aligned with true timings (according to sytem clock)
             total_emitted_frames: 0,
+            finished_resampling_producer: finished_resampling_producer,
         })
     }
 
@@ -1305,9 +1318,7 @@ impl InputStreamAlignerConsumer {
         Ok(())
     }
 
-    fn handle_metadata(&mut self, metadata: AudioBufferMetadata) -> Result<(), Box<dyn std::error::Error>> {
-        let target_emitted_frames = metadata.target_emitted_frames;
-        let num_available_frames = metadata.num_frames;
+    fn handle_metadata(&mut self, num_available_frames : u64, target_emitted_frames : i128) -> Result<(), Box<dyn std::error::Error>> {
         let estimated_emitted_frames = input_to_output_frames(num_available_frames as i128, self.input_sample_rate, self.dynamic_output_sample_rate);
         let updated_total_frames_emitted = self.total_emitted_frames + estimated_emitted_frames;
         // dynamic adjustment to synchronize input devices to global clock:
@@ -1330,30 +1341,73 @@ impl InputStreamAlignerConsumer {
         Ok(())
     }
 
-    fn process_audio_data(&mut self) -> Result<&[f32], Box<dyn std::error::Error>> {
+    fn resample(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
         // process all recieved audio chunks
-        while let Some(meta) = self.input_audio_buffer_metadata_consumer.try_pop() {
-            self.handle_metadata(meta)?;
+        match self.heap_cons_reciever.recv() {
+            Ok(msg) => match msg {
+                AudioBufferMetadata::Arrive(num_available_frames, target_emitted_frames) => {
+                    self.handle_metadata(num_available_frames, target_emitted_frames)?;
+                    self.finished_resampling_producer.send(())?;
+                    true
+                }
+                HeapConsSendMsg::Teardown() => {
+                    false
+                }
+            },
+            Err(TryRecvError::Empty) => true,          // nothing waiting; continue processing
+            Err(TryRecvError::Disconnected) => false,   // sender dropped; bail out or log
         }
-    }
-
-
-    fn available(&self) -> usize {
-        return self.input_audio_buffer_consumer.available();
-    }
-
-    // please call process_audio_data first or this will give you empty array
-    fn get_chunk_to_read(&mut self, size: usize) -> Result<&[f32], Box<dyn std::error::Error>> {
-        // then emit them
-        Ok(self.input_audio_buffer_consumer.get_chunk_to_read(size))
     }
 }
 
-// make (producer, consumer) for input audio alignment
-fn create_input_stream_aligner(input_sample_rate: u32, output_sample_rate: u32, history_len: usize, audio_buffer_seconds: u32, resampler_quality: i32) -> Result<(InputStreamAlignerProducer, InputStreamAlignerConsumer), Box<dyn Error>> {
+struct InputStreamAlignerConsumer {
+    final_audio_buffer_consumer: BufferedCircularConsumer<f32>,
+    thread_message_sender: mpsc::Sender<AudioBufferMetadata>,
+    finished_message_reciever: mpsc::Reciever<()>,
+}
+
+impl InputStreamAlignerConsumer {
+    fn new(final_audio_buffer_consumer: BufferedCircularConsumer<f32>, thread_message_sender: mpsc::Sender<AudioBufferMetadata>) {
+        Self {
+            final_audio_buffer_consumer: final_audio_buffer_consumer,
+            thread_message_sender: thread_message_sender,
+            finished_message_reciever: finished_message_reciever,
+        }
+    }
+
+    fn drop(&self) {
+        if let Err(err) = self.thread_message_sender.send(AudioBufferMetadata::Teardown()) {
+            eprintln!("failed to send shutdown signal: {}", err);
+        }
+    }
+
+    fn get_chunk_to_read(&self, size: usize) -> (bool, &[f32]) {
+        while self.final_audio_buffer_consumer.available() <= size {
+            // wait for data to arrive
+            match self.finished_message_reciever.recv() {
+                Ok(()) => {
+                    
+                }
+                Err(err) => {
+                    eprintln!("channel closed: {err}");
+                    return (false, &[]),
+                }
+            }
+        }
+        self.final_audio_buffer_consumer.get_chunk_to_read(size)
+    }
+
+    fn finish_read(&mut self, size: usize) -> usize {
+        self.final_audio_buffer_consumer.finish_read(size)
+    }
+}
+
+// make (producer (recieves audio data from device), resampler (resamples input audio to target rate), consumer (contains resampled data)) for input audio alignment
+fn create_input_stream_aligner(input_sample_rate: u32, output_sample_rate: u32, history_len: usize, audio_buffer_seconds: u32, resampler_quality: i32) -> Result<(InputStreamAlignerProducer, InputStreamAlignerResampler, InputStreamAlignerConsumer), Box<dyn Error>> {
     let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
     let (input_audio_buffer_metadata_producer, input_audio_buffer_metadata_consumer) = mpsc::channel::<HeapConsSendMsg>();
-
+    let additional_input_audio_buffer_metadata_producer = input_audio_buffer_metadata_producer.clone(); // make another one, this is ok because it is multiple producer single consumer 
+    // this recieves data from audio buffer
     let producer = InputStreamAlignerProducer::new(
         input_sample_rate,
         output_sample_rate,
@@ -1362,16 +1416,29 @@ fn create_input_stream_aligner(input_sample_rate: u32, output_sample_rate: u32, 
         input_audio_buffer_metadata_producer
     )?;
 
-    let consumer = InputStreamAlignerConsumer::new(
+    let (finished_resampling_producer, finished_resampling_consumer) = mpsc::channel::<()>();
+
+    let (output_audio_buffer_producer, output_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
+// resampled_consumer: BufferedCircularConsumer::<f32>::new(resampled_consumer))
+    // this resamples, designed to run on a seperate thread
+    let resampler = InputStreamAlignerResampler::new(
         input_sample_rate,
         output_sample_rate,
         audio_buffer_seconds,
         resampler_quality,
         input_audio_buffer_consumer,
-        input_audio_buffer_metadata_consumer
+        input_audio_buffer_metadata_consumer,
+        output_audio_buffer_producer,
+        finished_resampling_producer,
     )?;
 
-    Ok((producer, consumer))
+    let consumer = InputStreamAlignerConsumer::new(
+        BufferedCircularConsumer::new(output_audio_buffer_consumer),
+        additional_input_audio_buffer_metadata_producer, // give it ability to send shutdown signal to thread
+        finished_resampling_consumer
+    );
+
+    Ok((producer, resampler, consumer))
 }
 
 type StreamId = u64;
@@ -1420,13 +1487,13 @@ impl OutputStreamAligner {
         })
     }
 
-    fn begin_audio_stream(&self, audio_buffer_seconds: u32, sample_rate: u32, resampler_quality: i32) -> (StreamId, HeapProd<f32>) {
+    fn begin_audio_stream(&self, audio_buffer_seconds: u32, sample_rate: u32, resampler_quality: i32) -> Result<(StreamId, HeapProd<f32>), Box<dyn Error>> {
         // this assigns unique ids in a thread-safe way
         let stream_index = self.cur_stream_id.fetch_add(1, Ordering::Relaxed);
         let (producer, consumer) = HeapRb::<f32>::new((audio_buffer_seconds * sample_rate) as usize).split();
         // send the consumer to the consume thread
-        self.heap_cons_sender.send(HeapConsSendMsg::Add(stream_index, sample_rate, audio_buffer_seconds, resampler_quality, consumer)).unwrap();
-        (stream_index, producer)
+        self.heap_cons_sender.send(HeapConsSendMsg::Add(stream_index, sample_rate, audio_buffer_seconds, resampler_quality, consumer))?;
+        Ok((stream_index, producer))
     }
 
     fn enqueue_audio(audio_data: &[f32], mut audio_producer: HeapProd<f32>) {
@@ -1436,12 +1503,14 @@ impl OutputStreamAligner {
         }
     }
 
-    fn end_audio_stream(&self, stream_index: StreamId) {
-        self.heap_cons_sender.send(HeapConsSendMsg::Remove(stream_index));
+    fn end_audio_stream(&self, stream_index: StreamId) -> Result<(), Box<dyn Error>> {
+        self.heap_cons_sender.send(HeapConsSendMsg::Remove(stream_index))?;
+        Ok(())
     }
 
-    fn interrupt_all_streams(&self) { 
-        self.heap_cons_sender.send(HeapConsSendMsg::InterruptAll());
+    fn interrupt_all_streams(&self) -> Result<(), Box<dyn Error>> { 
+        self.heap_cons_sender.send(HeapConsSendMsg::InterruptAll())?;
+        Ok(())
     }
     
     // frame size should be small, on the order of 1-2ms or less.
@@ -1573,13 +1642,22 @@ fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &Aec
     let mut aligner_consumers = Vec::new();
 
     for channel in 0..device_config.channels {
-        let (producer, consumer) = create_input_stream_aligner(
+        let (producer, resampler, consumer) = create_input_stream_aligner(
             device_config.sample_rate,
             aec_config.target_sample_rate,
             device_config.history_len,
             device_config.audio_buffer_seconds,
             device_config.resampler_quality)?;
         aligner_producers.push(producer);
+
+        // start the resampler thread
+        thread::spawn({
+            // it returns true when signaled to stop (such as when consumer goes out of scope)
+            while resampler.resample() {
+
+            }
+        });
+
         aligner_consumers.push(consumer);
     }
 
