@@ -1222,14 +1222,14 @@ impl InputStreamAlignerProducer {
         best_estimate_of_when_most_recent_ended
     }
 
-    fn process_chunk(&mut self, chunk: &[f32]) -> Option<std::time::Instant> {
+    fn process_chunk(&mut self, chunk: &[f32]) {
         let recieved_timestamp = Instant::now(); // store this first so we are as precise as possible
         let return_start_time = if let Some(start_time_value) = self.start_time {
             start_time_value
         } else {
             // choose a start time so that frames_when_chunk_ended starts out equal to chunk len
             recieved_timestamp - Duration::from_micros(frames_to_micros(chunk.len() as i128, self.input_sample_rate as i128) as u64)
-        }
+        };
 
         self.start_time = Some(return_start_time);
 
@@ -1281,12 +1281,12 @@ impl InputStreamAlignerConsumer {
             output_sample_rate: output_sample_rate,
             dynamic_output_sample_rate: output_sample_rate,
             // we need buffered because this interfaces with speex which expects continuous buffers
-            input_audio_buffer_consumer: BufferedResampledCircularConsumer::<f32>::new(
-                input_sample_rate: input_sample_rate,
-                output_sample_rate: output_sample_rate,
-                resampler_quality: resampler_quality,
-                audio_buffer_seconds: audio_buffer_seconds, 
-                consumer: BufferedCircularConsumer::<f32>::new(input_audio_buffer_consumer)
+            input_audio_buffer_consumer: ResampledBufferedCircularConsumer::new(
+                input_sample_rate,
+                output_sample_rate,
+                resampler_quality,
+                audio_buffer_seconds, 
+                BufferedCircularConsumer::<f32>::new(input_audio_buffer_consumer)
             )?,
             input_audio_buffer_metadata_consumer: input_audio_buffer_metadata_consumer,
             // alignment data, these are used to adjust resample rate so output stays aligned with true timings (according to sytem clock)
@@ -1454,12 +1454,12 @@ impl OutputStreamAligner {
                 Ok(msg) => match msg {
                     HeapConsSendMsg::Add(id, sample_rate, audio_buffer_seconds, resampler_quality, cons) => {
                         self.stream_consumers.insert(id, ResampledBufferedCircularConsumer::new(
-                            input_sample_rate: sample_rate,
-                            output_sample_rate: self.device_sample_rate,
-                            resampler_quality: resampler_quality,
+                            sample_rate,
+                            self.device_sample_rate,
+                            resampler_quality,
                             audio_buffer_seconds,
-                            consumer: BufferedCircularConsumer::new(cons)
-                        ));
+                            BufferedCircularConsumer::new(cons)
+                        )?);
                     }
                     HeapConsSendMsg::Remove(id) => {
                         // remove if present
