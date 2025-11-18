@@ -1381,6 +1381,9 @@ impl InputStreamAlignerConsumer {
         }
     }
 
+    // waits until we have at least that much data
+    // (or something errors)
+    // returns (success, audio_buffer)
     fn get_chunk_to_read(&self, size: usize) -> (bool, &[f32]) {
         while self.final_audio_buffer_consumer.available() <= size {
             // wait for data to arrive
@@ -1394,7 +1397,7 @@ impl InputStreamAlignerConsumer {
                 }
             }
         }
-        self.final_audio_buffer_consumer.get_chunk_to_read(size)
+        (true, self.final_audio_buffer_consumer.get_chunk_to_read(size))
     }
 
     fn finish_read(&mut self, size: usize) -> usize {
@@ -1829,10 +1832,14 @@ impl AecStream {
         Ok(())
     }
 
-    fn update(&self) {
+    fn update(&self, chunk_size: usize) {
         // todo: grab the buffers from stream aligners, feed them to aec, the send them back as outputs
         for input_key in &self.sorted_input_aligners {
-
+            if let Some(input_aligner) = self.input_aligners.get(input_key) {
+                input_aligner.get_chunk_to_read(chunk_size)
+            } else {
+                
+            };
         }
     }
 }
