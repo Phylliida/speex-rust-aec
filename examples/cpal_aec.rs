@@ -1104,11 +1104,11 @@ impl<T: Copy> ResampledBufferedCircularConsumer<T> {
         Ok(())
     }
 
-    fn available_to_resample() -> usize {
+    fn available_to_resample(&self) -> usize {
         self.consumer.available()
     }
 
-    fn available() -> usize {
+    fn available(&self) -> usize {
         self.resampled_consumer.available()
     }
 
@@ -1378,7 +1378,7 @@ impl OutputStreamAligner {
         })
     }
 
-    fn begin_audio_stream(&self, audio_buffer_seconds: usize, sample_rate: u32, resampler_quality: u32) -> (StreamId, HeapProd<f32>) {
+    fn begin_audio_stream(&self, audio_buffer_seconds: u32, sample_rate: u32, resampler_quality: u32) -> (StreamId, HeapProd<f32>) {
         // this assigns unique ids in a thread-safe way
         let stream_index = self.cur_stream_id.fetch_add(1, Ordering::Relaxed);
         let (producer, consumer) = HeapRb::<f32>::new((audio_buffer_seconds * (sample_rate as usize)) as usize).split();
@@ -1480,26 +1480,26 @@ impl OutputStreamAligner {
 struct InputDeviceConfig {
     host: Host,
     device_name: String,
-    channels: usize,
-    sample_rate: usize,
+    channels: u16,
+    sample_rate: u32,
     sample_format: SampleFormat,
     
     // number of audio chunks to hold in memory, for aligning input devices's values when dropped frames/clock offsets. 100 or so is fine
     history_len: usize,
     // how long buffer of input audio to store, should only really need a few seconds as things are mostly streamed
-    audio_buffer_seconds: usize,
+    audio_buffer_seconds: u32,
     resampler_quality: i32
 }
 
 struct OutputDeviceConfig {
     host: Host,
     device_name: String,
-    channels: usize,
-    sample_rate: usize,
+    channels: u16,
+    sample_rate: u32,
     sample_format: SampleFormat,
     
     // how long buffer of output audio to store, should only really need a few seconds as things are mostly streamed
-    audio_buffer_seconds: usize,
+    audio_buffer_seconds: u32,
     resampler_quality: i32
 }
 
@@ -1510,17 +1510,17 @@ struct AecConfig {
 }
 
 
-fn get_input_stream_aligners(device_config: InputDeviceConfig, aec_config: AecConfig) -> (Stream, Vec<InputStreamAligner>) {
+fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, Vec<InputStreamAligner>), Box<dyn std::error::Error>>  {
 
     let device = select_device(
         device_config.host.input_devices(),
-        device_config.device_name,
+        &device_config.device_name,
         "Input",
     )?;
 
     let supported_config = find_matching_device_config(
         &device,
-        device_config.device_name,
+        &device_config.device_name,
         device_config.channels,
         device_config.sample_rate,
         device_config.sample_format,
@@ -1549,17 +1549,17 @@ fn get_input_stream_aligners(device_config: InputDeviceConfig, aec_config: AecCo
     return (stream, aligners);
 }
 
-fn get_output_stream_aligners(device_config: OutputDeviceConfig, aec_config: AecConfig) -> (Stream, Vec<OutputStreamAligner>) {
+fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, Vec<OutputStreamAligner>), Box<dyn std::error::Error>> {
 
     let device = select_device(
         device_config.host.output_devices(),
-        device_config.device_name,
+        &device_config.device_name,
         "Output",
     )?;
 
     let supported_config = find_matching_device_config(
         &device,
-        device_config.device_name,
+        &device_config.device_name,
         device_config.channels,
         device_config.sample_rate,
         device_config.sample_format,
@@ -1609,25 +1609,28 @@ impl AecStream {
         aec_config: AecConfig
     ) -> Result<Self, Box<dyn Error>> {
         if target_sample_rate < 0 {
-            return Err("Target sample rate is {}, it must be greater than zero.".into(), target_sample_rate);
+            return Err(format!("Target sample rate is {}, it must be greater than zero.", target_sample_rate).into());
         }
 
         return Ok(Self {
+           aec: None,
            aec_config: aec_config,
            input_streams: HashMap::new(),
            output_streams: HashMap::new(),
            input_aligners: HashMap::new(),
            output_aligners: HashMap::new(),
+           sorted_input_aligners: Vec::new(),
+           sorted_output_aligners: Vec::new(),
            input_channels: 0,
            output_channels: 0,
         })
     }
 
-    fn num_input_channels(&self) {
+    fn num_input_channels(&self) -> usize {
         self.input_aligners.values().flatten().count()
     }
 
-    fn num_output_aligners(&self) {
+    fn num_output_channels(&self) -> usize {
         self.output_aligners.values().flatten().count()
     }
 
@@ -1650,14 +1653,14 @@ impl AecStream {
         ))
     }
 
-    fn update_aec(&self) {
+    fn update_aec(&mut self) {
         if self.num_input_channels() != self.input_channels || self.num_output_channels() != self.output_channels {
             self.reinitialize_aec();
         }
     }
 
-    fn add_input_device(&mut self, config: InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        let (stream, aligners) = get_input_stream_aligners(config, self.aec_config);
+    fn add_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
+        let (stream, aligners) = get_input_stream_aligners(config, &self.aec_config)?;
         if let Some(stream) = self.input_streams.get(&config.device_name) {
             stream.pause()?;
         }
@@ -1668,8 +1671,8 @@ impl AecStream {
         Ok(())
     }
 
-    fn add_output_device(config: OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        let (stream, aligners) = get_output_stream_aligners(config, self.aec_config);
+    fn add_output_device(config: &OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
+        let (stream, aligners) = get_output_stream_aligners(config, &self.aec_config)?;
         if let Some(stream) = self.output_streams.get(&config.device_name) {
             stream.pause()?;
         }
@@ -1680,7 +1683,7 @@ impl AecStream {
         Ok(())
     }
 
-    fn remove_input_device(&mut self, config: InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
+    fn remove_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(stream) = self.input_streams.get(&config.device_name) {
             stream.pause()?;
         }
@@ -1691,7 +1694,7 @@ impl AecStream {
         Ok(())
     }
 
-    fn remove_output_device(&mut self, config: OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
+    fn remove_output_device(&mut self, config: &OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(stream) = self.output_streams.get(&config.device_name) {
             stream.pause()?;
         }
@@ -1718,7 +1721,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn select_device(
     devices: Result<cpal::Devices, cpal::DevicesError>,
-    target: &str,
+    target: &String,
     kind: &str,
 ) -> Result<Device, Box<dyn Error>> {
     match devices {
@@ -1729,7 +1732,7 @@ fn select_device(
                 let name = device.name().unwrap_or_else(|_| "<unknown device>".to_string());
                 available.push(name.clone());
 
-                if name == target {
+                if &name == target {
                     return Ok(device);
                 }
             }
@@ -1750,7 +1753,7 @@ fn select_device(
 
 fn find_matching_device_config(
     device: &Device,
-    device_name: &str,
+    device_name: &String,
     channels: u16,
     sample_rate: u32,
     format: SampleFormat,
@@ -1814,7 +1817,7 @@ fn find_matching_device_config(
 
 fn build_input_alignment_stream(
     device: &Device,
-    config: InputDeviceConfig,
+    config: &InputDeviceConfig,
     supported_config: SupportedStreamConfig,
     channel_aligners: Vec<InputStreamAligner>,
 ) -> Result<Stream, cpal::BuildStreamError> {
@@ -1849,7 +1852,7 @@ fn build_input_alignment_stream(
 
 fn build_input_alignment_stream_typed<T>(
     device: &Device,
-    config: InputDeviceConfig,
+    config: &InputDeviceConfig,
     supported_config: SupportedStreamConfig,
     channel_aligners: Vec<InputStreamAligner>,
 ) -> Result<Stream, cpal::BuildStreamError>
@@ -1861,7 +1864,7 @@ where
         .saturating_div(20) // ~50 ms of audio per channel
         .max(1024);
     let mut channel_buffers = (0..config.channels)
-        .map(|_| Vec::<f32>::with_capacity(per_channel_capacity))
+        .map(|_| Vec::<f32>::with_capacity(per_channel_capacity as usize))
         .collect::<Vec<_>>();
     
     device.build_input_stream(
@@ -1876,7 +1879,7 @@ where
             // undo the interleaving and convert to f32
             // todo: do this looping per channel in outermost instead of get_mut each time
             // (if it becomes a performance issue)
-            for frame in data.chunks(config.channels) {
+            for frame in data.chunks(config.channels as usize) {
                 for (channel_idx, sample) in frame.iter().enumerate() {
                     if let Some(buffer) = channel_buffers.get_mut(channel_idx) {
                         buffer.push(f32::from_sample(*sample));
@@ -1898,7 +1901,7 @@ where
 
 fn build_output_alignment_stream(
     device: &Device,
-    config: OutputDeviceConfig,
+    config: &OutputDeviceConfig,
     supported_config: SupportedStreamConfig,
     device_audio_channel_consumers: Vec<BufferedCircularConsumer>
 ) -> Result<Stream, cpal::BuildStreamError> {
@@ -1933,7 +1936,7 @@ fn build_output_alignment_stream(
 
 fn build_output_alignment_stream_typed<T>(
     device: &Device,
-    config: OutputDeviceConfig,
+    config: &OutputDeviceConfig,
     supported_config: SupportedStreamConfig,
     device_audio_channel_consumers: Vec<BufferedCircularConsumer>
 ) -> Result<Stream, cpal::BuildStreamError>
@@ -1944,7 +1947,7 @@ where
     device.build_output_stream(
         &supported_config.config(),
         move |data: &mut [T], _| {
-            let frames = data.len() / config.channels;
+            let frames = data.len() / (config.channels as usize);
             if frames == 0 {
                 return;
             }
