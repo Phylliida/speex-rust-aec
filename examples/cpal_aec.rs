@@ -1184,13 +1184,13 @@ struct InputStreamAlignerProducer {
     input_sample_rate: u32,
     output_sample_rate: u32,
     input_audio_buffer_producer: HeapProd<f32>,
-    input_audio_buffer_metadata_producer: HeapProd<AudioBufferMetadata>,
+    input_audio_buffer_metadata_producer: mpsc::Sender<AudioBufferMetadata>,
     chunk_sizes: LocalRb<Heap<usize>>,
     system_time_in_frames_when_chunk_ended: LocalRb<Heap<i128>>
 }
 
 impl InputStreamAlignerProducer {
-    fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: usize, input_audio_buffer_producer: HeapProd<f32>, input_audio_buffer_metadata_producer: HeapProd<AudioBufferMetadata>) -> Result<Self, Box<dyn Error>>  {
+    fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: usize, input_audio_buffer_producer: HeapProd<f32>, input_audio_buffer_metadata_producer: mpsc::Sender<AudioBufferMetadata>) -> Result<Self, Box<dyn Error>>  {
         Ok(Self {
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
@@ -1253,9 +1253,7 @@ impl InputStreamAlignerProducer {
                 num_frames: appended_count as u64,
                 target_emitted_frames: input_to_output_frames(most_recent_ended_estimate, self.input_sample_rate, self.output_sample_rate)
             };
-            if let Err(metadata) = self.input_audio_buffer_metadata_producer.try_push(metadata) {
-                eprintln!("Error: metadata ring buffer full; dropping {:?}, this is very bad what happened", metadata);
-            }
+            self.input_audio_buffer_metadata_producer.send(metadata).unwrap();
         }
     }
 
@@ -1267,7 +1265,7 @@ struct InputStreamAlignerConsumer {
     output_sample_rate: u32,
     dynamic_output_sample_rate: u32,
     input_audio_buffer_consumer: ResampledBufferedCircularConsumer,
-    input_audio_buffer_metadata_consumer: HeapCons<AudioBufferMetadata>,
+    input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>,
     total_emitted_frames: i128,
 }
 
@@ -1275,7 +1273,7 @@ impl InputStreamAlignerConsumer {
     // Takes input audio and resamples it to the target rate
     // May slightly stretch or squeeze the audio (via resampling)
     // to ensure the outputs stay aligned with system clock
-    fn new(input_sample_rate: u32, output_sample_rate: u32, audio_buffer_seconds: u32, resampler_quality: i32, input_audio_buffer_consumer: HeapCons<f32>, input_audio_buffer_metadata_consumer: HeapCons<AudioBufferMetadata>) -> Result<Self, Box<dyn Error>>  {
+    fn new(input_sample_rate: u32, output_sample_rate: u32, audio_buffer_seconds: u32, resampler_quality: i32, input_audio_buffer_consumer: HeapCons<f32>, input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>) -> Result<Self, Box<dyn Error>>  {
         Ok(Self {
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
@@ -1332,20 +1330,29 @@ impl InputStreamAlignerConsumer {
         Ok(())
     }
 
-    fn get_chunk_to_read(&mut self, size: usize) -> Result<&[f32], Box<dyn std::error::Error>> {
-        // first, do resampling of any recieved chunks
+    fn process_audio_data(&mut self) -> Result<&[f32], Box<dyn std::error::Error>> {
+        // process all recieved audio chunks
         while let Some(meta) = self.input_audio_buffer_metadata_consumer.try_pop() {
             self.handle_metadata(meta)?;
         }
+    }
+
+
+    fn available(&self) -> usize {
+        return self.input_audio_buffer_consumer.available();
+    }
+
+    // please call process_audio_data first or this will give you empty array
+    fn get_chunk_to_read(&mut self, size: usize) -> Result<&[f32], Box<dyn std::error::Error>> {
         // then emit them
         Ok(self.input_audio_buffer_consumer.get_chunk_to_read(size))
     }
 }
 
-
+// make (producer, consumer) for input audio alignment
 fn create_input_stream_aligner(input_sample_rate: u32, output_sample_rate: u32, history_len: usize, audio_buffer_seconds: u32, resampler_quality: i32) -> Result<(InputStreamAlignerProducer, InputStreamAlignerConsumer), Box<dyn Error>> {
     let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
-    let (input_audio_buffer_metadata_producer, input_audio_buffer_metadata_consumer) = HeapRb::<AudioBufferMetadata>::new(1000).split(); // should be plenty for any practical use since it shouldn't get very behind
+    let (input_audio_buffer_metadata_producer, input_audio_buffer_metadata_consumer) = mpsc::channel::<HeapConsSendMsg>();
 
     let producer = InputStreamAlignerProducer::new(
         input_sample_rate,
