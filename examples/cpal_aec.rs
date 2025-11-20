@@ -1861,6 +1861,7 @@ struct AecStream {
     input_streams: HashMap<String, Stream>,
     output_streams: HashMap<String, Stream>,
     input_aligners: HashMap<String, Vec<InputStreamAlignerConsumer>>,
+    input_aligners_in_progress: HashMap<String, Vec<InputStreamAlignerConsumer>>,
     output_aligners: HashMap<String, Vec<OutputStreamAligner>>,
     sorted_input_aligners: Vec<String>,
     sorted_output_aligners: Vec<String>,
@@ -1884,6 +1885,7 @@ impl AecStream {
            input_streams: HashMap::new(),
            output_streams: HashMap::new(),
            input_aligners: HashMap::new(),
+           input_aligners_in_progress: HashMap::new(),
            output_aligners: HashMap::new(),
            sorted_input_aligners: Vec::new(),
            sorted_output_aligners: Vec::new(),
@@ -1921,113 +1923,83 @@ impl AecStream {
         Ok(())
     }
 
-    fn update_aec(&mut self) {
-        if self.num_input_channels() != self.input_channels || self.num_output_channels() != self.output_channels {
-            self.reinitialize_aec();
-        }
-    }
-
     fn add_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        let (stream, aligners) = get_input_stream_aligners(config, &self.aec_config)?;
-        if let Some(stream) = self.input_streams.get(&config.device_name) {
-            stream.pause()?;
-        }
-        self.input_streams.insert(config.device_name.clone(), stream);
-        self.input_aligners.insert(config.device_name.clone(), aligners);
-
-        self.update_aec();
-        Ok(())
+        self.device_update_sender.send(DeviceUpdateMessage::AddInputDevice(config.clone()))
     }
 
     fn add_output_device(&mut self, config: &OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        let (stream, aligners) = get_output_stream_aligners(config, &self.aec_config)?;
-        if let Some(stream) = self.output_streams.get(&config.device_name) {
-            stream.pause()?;
-        }
-        self.output_streams.insert(config.device_name.clone(), stream);
-        self.output_aligners.insert(config.device_name.clone(), aligners);
-
-        self.update_aec();
-        Ok(())
+        self.device_update_sender.send(DeviceUpdateMessage::AddOutputDevice(config.clone()))
     }
 
     fn remove_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(stream) = self.input_streams.get(&config.device_name) {
-            stream.pause()?;
-        }
-        self.input_streams.remove(&config.device_name);
-        self.input_aligners.remove(&config.device_name);
-
-        self.update_aec();
-        Ok(())
+        self.device_update_sender.send(DeviceUpdateMessage::RemoveInputDevice(config.clone()))?;
     }
 
     fn remove_output_device(&mut self, config: &OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(stream) = self.output_streams.get(&config.device_name) {
-            stream.pause()?;
-        }
-        self.input_streams.remove(&config.device_name);
-        self.input_aligners.remove(&config.device_name);
-
-        self.update_aec();
-        Ok(())
+        self.device_update_sender.send(DeviceUpdateMessage::RemoveOutputDevice(config.clone()))?;
     }
 
     fn update(&self, chunk_size: usize) {
-        // there's a subtle bug where, say we initialize a device here
-        // we wouldn't get anything for that device for a little bit
-        // say device A started at time t=0
-        // outputs 1000 samples per t
-        // device B started at t=3.5
-        // outputs also 1000 samples per t
-        // but at t=4 if we request 1000 samples from each
-        // we won't get B's 1000 samples until t=4.5
-        // and then A will be 500 behind
-        // (because A's 1000 samples will be t=3->t=4)
-        // (but B's 1000 samples will be t=3.5->t=4.5)
-        // this offset will continue indefinately
-        // seems only way to fix that is to throw away B's initial 500 samples
-        // which seems fine since we already have alignment data
-        // basically, we specify when we'd like first samples to begin when initializing the device
-        // and throw away any samples that occur before then
-        // that's ok but not ideal cause we are dropping data
-        // a better solution is to pad the pre-device samples with zeros
-        // that way we always get all the device data
+        // todo: move to crossbeam to avoid mpsc locks
+        loop {
+            match receiver.try_recv() {
+                Ok(msg) => {
+                    Ok(msg) => match msg {
+                        DeviceUpdateMessage::AddInputDevice(config) {
+                            let (stream, aligners) = get_input_stream_aligners(config, &self.aec_config)?;
+                            if let Some(stream) = self.input_streams.get(&config.device_name) {
+                                stream.pause()?;
+                            }
+                            self.input_streams.insert(config.device_name.clone(), stream);
+                            self.input_aligners_in_progress.insert(config.device_name.clone(), aligners);
+                            self.input_aligners.insert(config.device_name.clone(), Vec::new());
 
-        // okay so pad zeros is a good option
-        // but how do we decide how many pad zeros?
-        // there are a few things that happen:
-        // for input:
-        // initialize device object
-        // recieve first audio data
-        // but also, recieve first audio data might be bursty
-        // so the time estimate isn't particularly good anyway
-        // until we've recieved 10-20 or so samples
-        // 
-        // okay so what if we store device init time
-        // and then look at first recieved time - size of first buffer
-        // and look a difference, then pad with that many zeros
-        // then resampling will calibrate to give us what we want
-        // that seems best option
-        // as device init time will always be aligned to our chunks
-        // since that's when we init device
-        // (for inputs)
+                            self.reinitialize_aec();
+                            Ok(())
+                        }
+                        DeviceUpdateMessage::RemoveInputDevice(config) {
+                            if let Some(stream) = self.input_streams.get(&config.device_name) {
+                                stream.pause()?;
+                            }
+                            self.input_streams.remove(&config.device_name);
+                            self.input_aligners.remove(&config.device_name);
+                            self.input_aligners_in_progress.remove(&config.device_name);
 
-        // meh that's so offset it doesn't seem great
-        // I think throwing out input device samples is much better option
+                            self.reinitialize_aec();
+                            Ok(())
+                        }
+                        DeviceUpdateMessage::AddOutputDevice(config) {
+                            let (stream, aligners) = get_output_stream_aligners(config, &self.aec_config)?;
+                            if let Some(stream) = self.output_streams.get(&config.device_name) {
+                                stream.pause()?;
+                            }
+                            self.output_streams.insert(config.device_name.clone(), stream);
+                            self.output_aligners.insert(config.device_name.clone(), aligners);
 
-        // okay so if we read like 1000 samples the only issue is we didn't get enough first pass
-        // from the input device
-        // and so other devices are now ahead
-        // we know what time this update occurs on
-        // and we have estimate of input samples
-        // so we should be able to just find that offset in the input stream
-        // so what if we wait 1-2 seconds
-        // asking if it is ready
-        // and once it is "ready"
-        // we start sampling relative to the current offset
+                            self.reinitialize_aec();
+                            Ok(())
+                        }
+                        DeviceUpdateMessage::RemoveOutputDevice(config) {
+                            if let Some(stream) = self.output_streams.get(&config.device_name) {
+                                stream.pause()?;
+                            }
+                            self.output_streams.remove(&config.device_name);
+                            self.output_aligners.remove(&config.device_name);
 
-
+                            self.reinitialize_aec();
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    // no message available right now
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    // sender dropped; receiver will never get more messages
+                    // todo: add error
+                }
+            } 
+        }
         // similarly, if we initialize an output device here
         // we may not get any audio for a little bit
         // won't get 
@@ -2039,6 +2011,14 @@ impl AecStream {
             // todo: simply pass through input_channels, no need for aec
             return;
         }
+
+
+        for key in &self.sorted_input_aligners {
+            if let Some(aligners_in_progress) = self.input_aligners.get_mut(key) {
+                // final thing todo is to 
+            }
+        }
+
         let mut mic_frame = vec![0i16; chunk_size * self.input_channels];
         let mut spk_frame = vec![0i16; chunk_size * self.output_channels];
         let mut out_frame = vec![0i16; mic_frame.len()];
