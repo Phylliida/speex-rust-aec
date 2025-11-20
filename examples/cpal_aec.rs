@@ -53,7 +53,7 @@ use speex_rust_aec::{
     speex_echo_cancellation, speex_echo_ctl, EchoCanceller, Resampler, SPEEX_ECHO_SET_SAMPLING_RATE,
 };
 
-use std::time::Instant;
+use std::time::{Instant, UNIX_EPOCH};
 
 
 const DEFAULT_AEC_RATE: u32 = 48_000;
@@ -953,13 +953,11 @@ fn micros_to_frames(microseconds: i128, sample_rate: i128) -> i128 {
     microseconds * sample_rate / 1000000
 }
 
-fn frames_to_micros(frames: i128, sample_rate: i128) -> i128 {
+fn frames_to_micros(frames: u128, sample_rate: u128) -> u128 {
     // frames = (microseconds * sample_rate / 1 000 000)
     // frames * 1_000_000 = microseconds * sample_rate
     frames * 1000000 / sample_rate // = microseconds
 }
-
-
 
 
 
@@ -1173,67 +1171,68 @@ impl ResampledBufferedCircularProducer {
 }
 
 enum AudioBufferMetadata {
-    Arrive(u64, i128),
+    Arrive(u64, u128, u128, bool),
     Teardown(),
 }
 
 
 struct InputStreamAlignerProducer {
-    start_time: Option<std::time::Instant>,
+    start_time_micros: Option<u128>,
     input_sample_rate: u32,
     output_sample_rate: u32,
     input_audio_buffer_producer: HeapProd<f32>,
     input_audio_buffer_metadata_producer: mpsc::Sender<AudioBufferMetadata>,
     chunk_sizes: LocalRb<Heap<usize>>,
-    system_time_in_frames_when_chunk_ended: LocalRb<Heap<i128>>
+    system_time_micros_when_chunk_ended: LocalRb<Heap<u128>>,
+    num_calibration_packets: u32,
+    num_packets_recieved: u64,
+    num_emitted_frames: u128,
 }
 
 impl InputStreamAlignerProducer {
-    fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: usize, input_audio_buffer_producer: HeapProd<f32>, input_audio_buffer_metadata_producer: mpsc::Sender<AudioBufferMetadata>) -> Result<Self, Box<dyn Error>>  {
+    fn new(input_sample_rate: u32, output_sample_rate: u32, history_len: usize, num_calibration_packets: u32, input_audio_buffer_producer: HeapProd<f32>, input_audio_buffer_metadata_producer: mpsc::Sender<AudioBufferMetadata>) -> Result<Self, Box<dyn Error>>  {
         Ok(Self {
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
             input_audio_buffer_producer: input_audio_buffer_producer,
             input_audio_buffer_metadata_producer: input_audio_buffer_metadata_producer,
             // alignment data, these are used to adjust resample rate so output stays aligned with true timings (according to sytem clock)
-            start_time: None,
             chunk_sizes: LocalRb::<Heap<usize>>::new(history_len),
-            system_time_in_frames_when_chunk_ended: LocalRb::<Heap<i128>>::new(history_len),
+            system_time_micros_when_chunk_ended: LocalRb::<Heap<u128>>::new(history_len),
+            num_calibration_packets: num_calibration_packets,
+            num_packets_recieved: 0,
+            num_emitted_frames: 0
         })
     }
 
-    fn estimate_when_most_recent_ended(&self) -> i128 {
+    fn estimate_micros_when_most_recent_ended(&self) -> u128 {
         // Take minimum over estimates for all previous recieved
         // Some may be delayed due to cpu being busy, but none can ever arrive too early
         // so this should be a decent estimate
         // it does not account for hardware latency, but we cannot account for that without manual calibration
         // (btw, CPAL timestamps do not work because they may be different for different devices)
         // (wheras this synchronizes us to global system time)
-        let mut best_estimate_of_when_most_recent_ended = if let Some(first_time) = self.system_time_in_frames_when_chunk_ended.first() {
-            *first_time
+        let mut best_estimate_of_when_most_recent_ended = if let Some(most_recent_time) = self.system_time_in_frames_when_chunk_ended.last() {
+            *most_recent_time
         }
         else {
-            0 as i128
+            u128::MAX
         };
-        for (chunk_size, frames_when_chunk_ended) in self.chunk_sizes.iter().zip(self.system_time_in_frames_when_chunk_ended.iter()) {
-            best_estimate_of_when_most_recent_ended = (*frames_when_chunk_ended).min(best_estimate_of_when_most_recent_ended+(*chunk_size as i128));
+        let mut frames_until_most_recent = 0 as u128;
+        // iterate from most recent backwards (that's what .rev() does)
+        for (chunk_size, micros_when_chunk_ended) in self.chunk_sizes.iter().zip(self.system_time_micros_when_chunk_ended.iter()).rev() {
+            let micros_until_most_recent_ended = frames_to_micros(frames_until_most_recent as u128, self.input_sample_rate);
+            let estimate_of_micros_most_recent_ended = *micros_when_chunk_ended + micros_until_most_recent_ended;
+            best_estimate_of_when_most_recent_ended = (estimate_of_micros_most_recent_ended).min(best_estimate_of_when_most_recent_ended);
+            // timestamps are at end, not at start, so only increment this after
+            frames_until_most_recent += *chunk_size as u128;
         }
         best_estimate_of_when_most_recent_ended
     }
 
-    fn process_chunk(&mut self, chunk: &[f32]) -> Result<(), Box<dyn Error>>   {
-        let recieved_timestamp = Instant::now(); // store this first so we are as precise as possible
-        let return_start_time = if let Some(start_time_value) = self.start_time {
-            start_time_value
-        } else {
-            // choose a start time so that frames_when_chunk_ended starts out equal to chunk len
-            recieved_timestamp - Duration::from_micros(frames_to_micros(chunk.len() as i128, self.input_sample_rate as i128) as u64)
-        };
+    fn process_chunk(&mut self, chunk: &[f32]) -> Result<(), Box<dyn Error>> {\
+        let micros_when_chunk_received = Instant::now().duration_since(UNIX_EPOCH).as_micros();
 
-        self.start_time = Some(return_start_time);
-
-        // now we have assigned start_time, get it in terms of frames
-        let frames_when_chunk_ended = micros_to_frames(recieved_timestamp.duration_since(return_start_time).as_micros() as i128, i128::from(self.input_sample_rate));
        
         let appended_count = self.input_audio_buffer_producer.push_slice(chunk);
         if appended_count < chunk.len() { // todo: auto resize
@@ -1242,17 +1241,49 @@ impl InputStreamAlignerProducer {
         if appended_count > 0 {
             // delibrately overwrite once we pass history len, we keep a rolling buffer of last 100 or so
             self.chunk_sizes.push_overwrite(appended_count);
-            self.system_time_in_frames_when_chunk_ended.push_overwrite(frames_when_chunk_ended);
+            self.system_time_in_frames_when_chunk_ended.push_overwrite(micros_when_chunk_received);
 
             // use our estimate to suggest how many frames we should have emitted
             // this is used to dynamically adjust sample rate until we actually emit that many frames
             // that ensures that we stay synchronized to the system clock and do not drift
-            let most_recent_ended_estimate = self.estimate_when_most_recent_ended();
+            let micros_when_chunk_ended = self.estimate_micros_when_most_recent_ended();
+
+            self.num_emitted_frames += appended_count;
+
+            let target_emitted_frames, calibrated = if self.num_packets_recieved < self.num_calibration_packets {
+                // until we've recieved enough calibration packets, we don't have good enough time estimate
+                // thus, simply request num_emitted_frames emitted
+                // this avoids large amounts of distortion if we get an initial burst of packets on device init
+                self.num_emitted_frames, false
+            } else {
+                // calibration finished, setup start_time_micros
+                if self.num_packets_recieved == self.num_calibration_packets {
+                    // now we can actually make a good estimate of our current time,
+                    // which allows us to make a good estimate of start time (just convert number packets emitted into an offset)
+                    // this isn't ideal when calibration involved a dropped packet
+                    // but is about as good as we can do
+                    self.start_time_micros = micros_when_chunk_ended - frames_to_micros(self.num_emitted_frames, self.input_sample_rate);
+                }
+                // look at actual elapsed time, and use that to say how many frames we would have preferred to emitted
+                // this can be used later to adjust sample rate slightly to keep us in line with system time
+                let elapsed_micros = micros_when_chunk_ended - self.start_time_micros;
+                micros_to_frames(elapsed_micros, self.input_sample_rate), true
+            };
+
+            // increment afterwards incase num_calibration_packets = 0
+            self.num_packets_recieved += 1 as u64;
+
+            let elapsed_frames = micros_to_frames(micros_when_chunk_ended)
             let metadata = AudioBufferMetadata::Arrive(
                 // num available frames
                 appended_count as u64,
-                // target_emitted_frames
-                input_to_output_frames(most_recent_ended_estimate, self.input_sample_rate, self.output_sample_rate)
+                // estimated timestamp after this sample
+                most_recent_ended_estimate,
+                // target emitted frames
+                target_emitted_frames,
+                // calibrated
+                calibrated
+
             );
             self.input_audio_buffer_metadata_producer.send(metadata)?;
         }
@@ -1260,6 +1291,9 @@ impl InputStreamAlignerProducer {
 
 }
 
+enum ResamplingMetadata {
+    Arrive(usize, u128, bool),
+}
 
 struct InputStreamAlignerResampler {
     input_sample_rate: u32,
@@ -1268,7 +1302,10 @@ struct InputStreamAlignerResampler {
     input_audio_buffer_consumer: ResampledBufferedCircularConsumer,
     input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>,
     total_emitted_frames: i128,
-    finished_resampling_producer: mpsc::Sender<()>
+    total_received_frames: i128,
+    total_processed_input_frames: i128,
+    start_time_micros: u128,
+    finished_resampling_producer: mpsc::Sender<ResamplingMetadata>
 }
 
 impl InputStreamAlignerResampler {
@@ -1283,7 +1320,7 @@ impl InputStreamAlignerResampler {
         input_audio_buffer_consumer: HeapCons<f32>,
         input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>
         output_audio_buffer_producer: HeapProd<f32>,
-        finished_resampling_producer: mpsc::Sender<()>
+        finished_resampling_producer: mpsc::Sender<ResamplingMetadata>
     ) -> Result<Self, Box<dyn Error>>  {
         Ok(Self {
             input_sample_rate: input_sample_rate,
@@ -1301,7 +1338,10 @@ impl InputStreamAlignerResampler {
             input_audio_buffer_metadata_consumer: input_audio_buffer_metadata_consumer,
             // alignment data, these are used to adjust resample rate so output stays aligned with true timings (according to sytem clock)
             total_emitted_frames: 0,
+            total_received_frames: 0,
+            total_processed_input_frames: 0,
             finished_resampling_producer: finished_resampling_producer,
+            start_time_micros: None,
         })
     }
 
@@ -1318,39 +1358,54 @@ impl InputStreamAlignerResampler {
         Ok(())
     }
 
-    fn handle_metadata(&mut self, num_available_frames : u64, target_emitted_frames : i128) -> Result<(), Box<dyn std::error::Error>> {
-        let estimated_emitted_frames = input_to_output_frames(num_available_frames as i128, self.input_sample_rate, self.dynamic_output_sample_rate);
+    fn handle_metadata(&mut self, num_available_frames : u64, target_emitted_input_frames : u128) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+        let estimated_emitted_frames = input_to_output_frames(num_available_frames as u128, self.input_sample_rate, self.dynamic_output_sample_rate);
         let updated_total_frames_emitted = self.total_emitted_frames + estimated_emitted_frames;
+        let target_emitted_output_frames = input_to_output_frames(target_emitted_input_frames, self.input_sample_rate, self.output_sample_rate);
         // dynamic adjustment to synchronize input devices to global clock:
         // not enough frames, we need to increase dynamic sample rate (to get more samples)
-        if updated_total_frames_emitted < target_emitted_frames {
+        if updated_total_frames_emitted < target_emitted_output_frames {
             self.increase_dynamic_sample_rate()?;
         }
         // too many frames, we need to decrease dynamic sample rate (to get less samples)
-        else if updated_total_frames_emitted > target_emitted_frames {
+        else if updated_total_frames_emitted > target_emitted_output_frames {
             self.decrease_dynamic_sample_rate()?;
         }
 
         //// do resampling ////
-        let (_consumed, produced) = self.input_audio_buffer_consumer.resample(num_available_frames as u32)?;
+        let (consumed, produced) = self.input_audio_buffer_consumer.resample(num_available_frames as u32)?;
 
         // the main downside of this is that it'll be persistently behind by 0.6ms or so (the resample frame size), but we'll quickly adjust for that so this shouldn't be a major issue
         // todo: think about how to fix this better (maybe current solution is as good as we can do, and it should average out to correct since past ones accumulated will result in more for this one, still, it's likely to stay behind by this amount)
         self.total_emitted_frames += produced as i128;
 
-        Ok(())
+        Ok((consumed, produced))
     }
 
     fn resample(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
         // process all recieved audio chunks
         match self.heap_cons_reciever.recv() {
             Ok(msg) => match msg {
-                AudioBufferMetadata::Arrive(num_available_frames, target_emitted_frames) => {
-                    self.handle_metadata(num_available_frames, target_emitted_frames)?;
-                    self.finished_resampling_producer.send(())?;
+                AudioBufferMetadata::Arrive(num_available_frames, system_micros_after_packet_finishes, target_emitted_frames, calibrated) => {
+                    let num_leftovers_from_prev = self.total_received_frames - self.total_processed_input_frames;
+                    self.total_received_frames += num_available_frames;
+                    // if it hypothetically consumed all frames every time,
+                    // then we would know that current time in system_micros_after_packet_finishes
+                    // however, there are a few things that happen:
+                    // 1. There are some "leftover" samples from previously
+                    // 2. There are some "ignored" samples from cur (that are later leftover)
+
+
+                    let consumed, produced = self.handle_metadata(num_available_frames, target_emitted_frames)?;
+                    self.total_processed_input_frames += consumed;
+                    let num_of_ours_consumed = consumed - num_leftovers_from_prev;
+                    let num_of_ours_leftover = num_available_frames - num_of_ours_consumed;
+                    let micros_earlier = frames_to_micros(num_of_ours_leftover, self.input_sample_rate);
+                    let system_micros_after_resampled_packet_finishes = system_micros_after_packet_finishes - micros_earlier;
+                    self.finished_resampling_producer.send(ResamplingMetadata::Arrive(produced, system_micros_after_packet_finishes, calibrated))?;
                     true
-                }
-                HeapConsSendMsg::Teardown() => {
+                },
+                AudioBufferMetadata::Teardown() => {
                     false
                 }
             },
@@ -1363,15 +1418,18 @@ impl InputStreamAlignerResampler {
 struct InputStreamAlignerConsumer {
     final_audio_buffer_consumer: BufferedCircularConsumer<f32>,
     thread_message_sender: mpsc::Sender<AudioBufferMetadata>,
-    finished_message_reciever: mpsc::Reciever<()>,
+    finished_message_reciever: mpsc::Reciever<ResamplingMetadata>,
+    initial_metadata: Vec<ResamplingMetadata>,
+    calibrated: bool,
 }
 
 impl InputStreamAlignerConsumer {
-    fn new(final_audio_buffer_consumer: BufferedCircularConsumer<f32>, thread_message_sender: mpsc::Sender<AudioBufferMetadata>) {
+    fn new(final_audio_buffer_consumer: BufferedCircularConsumer<f32>, thread_message_sender: mpsc::Sender<AudioBufferMetadata>, finished_message_reciever: mpsc::Receiver<ResamplingMetadata>) {
         Self {
             final_audio_buffer_consumer: final_audio_buffer_consumer,
             thread_message_sender: thread_message_sender,
             finished_message_reciever: finished_message_reciever,
+            calibrated: false,
         }
     }
 
@@ -1381,19 +1439,48 @@ impl InputStreamAlignerConsumer {
         }
     }
 
+    fn get_chunk_to_read_at_micros(&self, micros_packet_finished: u128, size: usize) {
+        // non blocking cause maybe it's just not ready yet
+        loop {
+            match self.finished_message_reciever.try_recv() {
+                Ok(msg) => {
+                    match msg {
+                        ResamplingMetadata::Arrive(frames_recieved, system_micros_after_packet_finishes, calibrated) => {
+                            self.calibrated = calibrated;
+                            self.initial_metadata.push(msg.clone());
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    // no message available right now
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    // sender dropped; receiver will never get more messages
+                    break;
+                }
+            }
+        }
+        
+        let mut calibrated = false;
+
+    }
+
     // waits until we have at least that much data
     // (or something errors)
     // returns (success, audio_buffer)
-    fn get_chunk_to_read(&self, size: usize) -> (bool, &[f32]) {
+    fn get_chunk_to_read(&self, size: usize) -> (bool, bool, &[f32]) {
         while self.final_audio_buffer_consumer.available() <= size {
             // wait for data to arrive
             match self.finished_message_reciever.recv() {
-                Ok(()) => {
-                    
+                Ok(data) =>  match data {
+                    ResamplingMetadata::Arrive(frames_recieved, system_micros_after_packet_finishes, calibrated) => {
+
+                    }                    
                 }
                 Err(err) => {
                     eprintln!("channel closed: {err}");
-                    return (false, &[]),
+                    return (false, false, &[]),
                 }
             }
         }
