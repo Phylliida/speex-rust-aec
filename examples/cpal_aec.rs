@@ -1716,9 +1716,18 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
     Ok((stream, aligners))
 }
 
+enum DeviceUpdateMessage {
+    AddInputDevice(InputDeviceConfig),
+    RemoveInputDevice(InputDeviceConfig),
+    AddOutputDevice(OutputDeviceConfig),
+    RemoveOutputDevice(OutputDeviceConfig)
+}
+
 struct AecStream {
     aec: Option<EchoCanceller>,
     aec_config: AecConfig,
+    device_update_sender: mpsc::Sender<DeviceUpdateMessage>,
+    device_update_receiver: mpsc::Receiver<DeviceUpdateMessage>,
     input_streams: HashMap<String, Stream>,
     output_streams: HashMap<String, Stream>,
     input_aligners: HashMap<String, Vec<InputStreamAlignerConsumer>>,
@@ -1736,10 +1745,12 @@ impl AecStream {
         if aec_config.target_sample_rate < 0 {
             return Err(format!("Target sample rate is {}, it must be greater than zero.", aec_config.target_sample_rate).into());
         }
-
+        let (device_update_sender, device_update_receiver) = mpsc::channel::<HeapConsSendMsg>();
         Ok(Self {
            aec: None,
            aec_config: aec_config,
+           device_update_sender: device_update_sender,
+           device_update_receiver: device_update_receiver,
            input_streams: HashMap::new(),
            output_streams: HashMap::new(),
            input_aligners: HashMap::new(),
@@ -1833,17 +1844,98 @@ impl AecStream {
     }
 
     fn update(&self, chunk_size: usize) {
-        // todo: grab the buffers from stream aligners, feed them to aec, the send them back as outputs
-        let input_audio_buffer = // todo set input buffer
-        let output_audio_buffer = // todo get output audio buffer
-        for (input_i, input_key) in &self.sorted_input_aligners.iter().enumerate() {
-            if let Some(input_aligner) = self.input_aligners.get(input_key) {
-                let input_channel_i_data = input_aligner.get_chunk_to_read(chunk_size);
-                // todo: assign into input_audio_buffer
-            } else {
-                // todo: set input_audio_buffer values to 0 for this channel
-            };
+        // there's a subtle bug where, say we initialize a device here
+        // we wouldn't get anything for that device for a little bit
+        // say device A started at time t=0
+        // outputs 1000 samples per t
+        // device B started at t=3.5
+        // outputs also 1000 samples per t
+        // but at t=4 if we request 1000 samples from each
+        // we won't get B's 1000 samples until t=4.5
+        // and then A will be 500 behind
+        // (because A's 1000 samples will be t=3->t=4)
+        // (but B's 1000 samples will be t=3.5->t=4.5)
+        // this offset will continue indefinately
+        // seems only way to fix that is to throw away B's initial 500 samples
+        // which seems fine since we already have alignment data
+        // basically, we specify when we'd like first samples to begin when initializing the device
+        // and throw away any samples that occur before then
+        // that's ok but not ideal cause we are dropping data
+        // a better solution is to pad the pre-device samples with zeros
+        // that way we always get all the device data
+
+        // okay so pad zeros is a good option
+        // but how do we decide how many pad zeros?
+        // there are a few things that happen:
+        // for input:
+        // initialize device object
+        // recieve first audio data
+        // but also, recieve first audio data might be bursty
+        // so the time estimate isn't particularly good anyway
+        // until we've recieved 10-20 or so samples
+        // 
+        // okay so what if we store device init time
+        // and then look at first recieved time - size of first buffer
+        // and look a difference, then pad with that many zeros
+        // then resampling will calibrate to give us what we want
+        // that seems best option
+        // as device init time will always be aligned to our chunks
+        // since that's when we init device
+        // (for inputs)
+
+        // meh that's so offset it doesn't seem great
+        // I think throwing out input device samples is much better option
+
+        // okay so if we read like 1000 samples the only issue is we didn't get enough first pass
+        // from the input device
+        // and so other devices are now ahead
+        // we know what time this update occurs on
+        // and we have estimate of input samples
+        // so we should be able to just find that offset in the input stream
+        // so what if we wait 1-2 seconds
+        // asking if it is ready
+        // and once it is "ready"
+        // we start sampling relative to the current offset
+
+
+        // similarly, if we initialize an output device here
+        // we may not get any audio for a little bit
+        // won't get 
+        if chunk_size == 0 {
+            return;
         }
+        let Some(aec) = self.aec.as_mut() else { return };
+        if self.output_channels == 0 {
+            // todo: simply pass through input_channels, no need for aec
+            return;
+        }
+        let mut mic_frame = vec![0i16; chunk_size * self.input_channels];
+        let mut spk_frame = vec![0i16; chunk_size * self.output_channels];
+        let mut out_frame = vec![0i16; mic_frame.len()];
+        for key in &self.sorted_input_aligners {
+            if let Some(channel_aligners) = self.input_aligners.get_mut(key) {
+                for aligner in channel_aligners {
+                    let (ok, chunk) = aligner.get_chunk_to_read(chunk_size);
+                    if ok {
+                        Self::write_channel_from_f32(
+                            chunk,
+                            mic_channel,
+                            self.input_channels,
+                            chunk_size,
+                            &mut mic_frame,
+                        );
+                        aligner.finish_read(chunk.len().min(chunk_size));
+                    } else {
+                        Self::clear_channel(mic_channel, self.input_channels, chunk_size, &mut mic_frame);
+                    }
+                    mic_channel += 1;
+                }
+            }
+            else {
+                mic_channel += 1;
+            }
+        }
+
         for (output_i, output_key) in &self.sorted_output_aligners.iter().enumerate() {
             if let Some(output_aligner) = self.output_aligners.get(output_key) {
                 let output_channel_i_data = output_aligner.get_chunk_to_read(chunk_size);
@@ -1853,6 +1945,27 @@ impl AecStream {
             };
         }
         // todo: send input_audio_buffer and output_audio_buffer in self.aec
+    }
+    fn write_channel_from_f32(
+        src: &[f32],
+        channel: usize,
+        total_channels: usize,
+        frames: usize,
+        dst: &mut [i16],
+    ) {
+        for frame in 0..frames {
+            let value = src.get(frame).copied().unwrap_or(0.0);
+            dst[frame * total_channels + channel] = Self::f32_to_i16(value);
+        }
+    }
+    fn clear_channel(channel: usize, total_channels: usize, frames: usize, dst: &mut [i16]) {
+        for frame in 0..frames {
+            dst[frame * total_channels + channel] = 0;
+        }
+    }
+    fn f32_to_i16(sample: f32) -> i16 {
+        let clamped = sample.clamp(-1.0, 1.0);
+        (clamped * i16::MAX as f32).round() as i16
     }
 }
     
