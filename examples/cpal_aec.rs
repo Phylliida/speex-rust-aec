@@ -938,12 +938,12 @@ where
 
 fn input_to_output_frames(input_frames: u128, in_rate: u32, out_rate: u32) -> u128 {
     // u128 to avoid overflow
-    ((input_frames * (out_rate as u128)) / (in_rate as u128))
+    (input_frames * (out_rate as u128)) / (in_rate as u128)
 }
 
 fn output_to_input_frames(output_frames: u128, in_rate: u32, out_rate: u32) -> u128 {
     // u128 to avoid overflow
-    ((output_frames * (in_rate as u128)) / (out_rate as u128)) as u128
+    (output_frames * (in_rate as u128)) / (out_rate as u128)
 }
 
 fn micros_to_frames(microseconds: u128, sample_rate: u128) -> u128 {
@@ -1194,7 +1194,7 @@ impl InputStreamAlignerProducer {
             system_time_micros_when_chunk_ended: LocalRb::<Heap<u128>>::new(history_len),
             num_calibration_packets: num_calibration_packets,
             num_packets_recieved: 0,
-            num_emitted_frames: 0
+            num_emitted_frames: 0,
             start_time_micros: None,
         })
     }
@@ -1224,7 +1224,7 @@ impl InputStreamAlignerProducer {
         best_estimate_of_when_most_recent_ended
     }
 
-    fn process_chunk(&mut self, chunk: &[f32]) -> Result<(), Box<dyn Error>> {\
+    fn process_chunk(&mut self, chunk: &[f32]) -> Result<(), Box<dyn Error>> {
         let micros_when_chunk_received = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock went backwards").as_micros();
 
        
@@ -1244,47 +1244,53 @@ impl InputStreamAlignerProducer {
 
             self.num_emitted_frames += appended_count as u128;
 
-            let target_emitted_frames, calibrated = if self.num_packets_recieved < self.num_calibration_packets {
+            let (target_emitted_frames, calibrated) = if self.num_packets_recieved < self.num_calibration_packets as u64 {
                 // until we've recieved enough calibration packets, we don't have good enough time estimate
                 // thus, simply request num_emitted_frames emitted
                 // this avoids large amounts of distortion if we get an initial burst of packets on device init
-                self.num_emitted_frames, false
+                (self.num_emitted_frames, false)
             } else {
                 // calibration finished, setup start_time_micros
-                if self.num_packets_recieved == self.num_calibration_packets {
+                if self.num_packets_recieved == self.num_calibration_packets as u64 {
                     // now we can actually make a good estimate of our current time,
                     // which allows us to make a good estimate of start time (just convert number packets emitted into an offset)
                     // this isn't ideal when calibration involved a dropped packet
                     // but is about as good as we can do
-                    self.start_time_micros = micros_when_chunk_ended - frames_to_micros(self.num_emitted_frames, self.input_sample_rate);
+                    self.start_time_micros = Some(micros_when_chunk_ended - frames_to_micros(self.num_emitted_frames, self.input_sample_rate as u128));
                 }
-                // look at actual elapsed time, and use that to say how many frames we would have preferred to emitted
-                // this can be used later to adjust sample rate slightly to keep us in line with system time
-                let elapsed_micros = micros_when_chunk_ended - self.start_time_micros;
-                micros_to_frames(elapsed_micros, self.input_sample_rate), true
+
+                if let Some(start_time_micros_value) = self.start_time_micros {
+                    // look at actual elapsed time, and use that to say how many frames we would have preferred to emitted
+                    // this can be used later to adjust sample rate slightly to keep us in line with system time
+                    let elapsed_micros = micros_when_chunk_ended - start_time_micros_value;
+                    (micros_to_frames(elapsed_micros, self.input_sample_rate as u128), true)
+                }
+                else {
+                    (self.num_emitted_frames, false)
+                }
             };
 
             // increment afterwards incase num_calibration_packets = 0
             self.num_packets_recieved += 1 as u64;
 
-            let elapsed_frames = micros_to_frames(micros_when_chunk_ended)
             let metadata = AudioBufferMetadata::Arrive(
                 // num available frames
                 appended_count as u64,
                 // estimated timestamp after this sample
-                most_recent_ended_estimate,
+                micros_when_chunk_ended,
                 // target emitted frames
                 target_emitted_frames,
                 // calibrated
                 calibrated
-
             );
             self.input_audio_buffer_metadata_producer.send(metadata)?;
         }
+        Ok(())
     }
 
 }
 
+#[derive(Clone)]
 enum ResamplingMetadata {
     Arrive(usize, u128, bool),
 }
@@ -1293,7 +1299,7 @@ struct InputStreamAlignerResampler {
     input_sample_rate: u32,
     output_sample_rate: u32,
     dynamic_output_sample_rate: u32,
-    input_audio_buffer_consumer: BufferedCircularConsumer<f32>,
+    input_audio_buffer_consumer: ResampledBufferedCircularProducer,
     input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>,
     total_emitted_frames: u128,
     total_received_frames: u128,
@@ -1311,7 +1317,7 @@ impl InputStreamAlignerResampler {
         audio_buffer_seconds: u32,
         resampler_quality: i32,
         input_audio_buffer_consumer: HeapCons<f32>,
-        input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>
+        input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>,
         output_audio_buffer_producer: HeapProd<f32>,
         finished_resampling_producer: mpsc::Sender<ResamplingMetadata>
     ) -> Result<Self, Box<dyn Error>> {
@@ -1386,23 +1392,23 @@ impl InputStreamAlignerResampler {
                     // however, there are a few things that happen:
                     // 1. There are some "leftover" samples from previously
                     // 2. There are some "ignored" samples from cur (that are later leftover)
-
-
-                    let consumed, produced = self.handle_metadata(num_available_frames, target_emitted_frames)?;
-                    self.total_processed_input_frames += consumed;
-                    let num_of_ours_consumed = consumed - num_leftovers_from_prev;
-                    let num_of_ours_leftover = num_available_frames - num_of_ours_consumed;
-                    let micros_earlier = frames_to_micros(num_of_ours_leftover, self.input_sample_rate);
-                    let system_micros_after_resampled_packet_finishes = system_micros_after_packet_finishes - micros_earlier;
+                    // this logic sets the timestamp to be correct relative to last resampled emitted
+                    // which is slightly distinct from system_micros_after_packet_finishes
+                    // because resampling may operate at some latency
+                    let (consumed, produced) = self.handle_metadata(num_available_frames, target_emitted_frames)?;
+                    self.total_processed_input_frames += consumed as u128;
+                    let num_of_ours_consumed = (consumed as i128) - (num_leftovers_from_prev as i128);
+                    let num_of_ours_leftover = (num_available_frames as i128) - (num_of_ours_consumed as i128);
+                    let micros_earlier = frames_to_micros(num_of_ours_leftover as u128, self.input_sample_rate as u128) as i128;
+                    let system_micros_after_resampled_packet_finishes = (system_micros_after_packet_finishes as i128) - micros_earlier;
                     self.finished_resampling_producer.send(ResamplingMetadata::Arrive(produced, system_micros_after_packet_finishes, calibrated))?;
-                    true
+                    Ok(true)
                 },
                 AudioBufferMetadata::Teardown() => {
                     Ok(false)
                 }
             },
-            Err(RecvError::Empty) => Ok(true),          // nothing waiting; continue processing
-            Err(RecvError::Disconnected) => Err("input metadata channel disconnected".into()),   // sender dropped; bail out or log
+            Err(RecvError) => Err("input metadata channel disconnected".into())   // sender dropped; bail out or log
         }
     }
 }
@@ -1473,9 +1479,9 @@ impl InputStreamAlignerConsumer {
                 // we will be able to get all samples for this packet, block until we get them
                 if num_samples_that_are_behind_current_packet > 0 {
                     // skip ahead so we are only getting samples for this packet
-                    self.final_audio_buffer_consumer.finish_read(num_samples_that_are_behind_current_packet);
+                    self.final_audio_buffer_consumer.finish_read(num_samples_that_are_behind_current_packet as usize);
                     let additional_samples_needed = (size as i128) - available_samples;
-                    read_success, samples = get_chunk_to_read(additional_samples_needed as usize);
+                    let (_read_success, _samples) = self.get_chunk_to_read(additional_samples_needed as usize);
                     true // we will read them again later, at which point we will do finish_read
                 }
                 // we started in the middle of this packet, we can't get enough, wait until next packet
@@ -1523,7 +1529,7 @@ impl InputStreamAlignerConsumer {
     // waits until we have at least that much data
     // (or something errors)
     // returns (success, audio_buffer)
-    fn get_chunk_to_read(&self, size: usize) -> (bool, &[f32]) {
+    fn get_chunk_to_read(&mut self, size: usize) -> (bool, &[f32]) {
         while self.final_audio_buffer_consumer.available() <= size {
             // wait for data to arrive
             match self.finished_message_reciever.recv() {
@@ -1532,7 +1538,7 @@ impl InputStreamAlignerConsumer {
                 }
                 Err(err) => {
                     eprintln!("channel closed: {err}");
-                    return (false, false, &[]),
+                    return (false, &[])
                 }
             }
         }
@@ -1578,7 +1584,7 @@ fn create_input_stream_aligner(input_sample_rate: u32, output_sample_rate: u32, 
 
    
     let consumer = InputStreamAlignerConsumer::new(
-        sample_rate: output_sample_rate,
+        output_sample_rate,
         BufferedCircularConsumer::new(output_audio_buffer_consumer),
         additional_input_audio_buffer_metadata_producer, // give it ability to send shutdown signal to thread
         finished_resampling_consumer
@@ -1590,7 +1596,7 @@ fn create_input_stream_aligner(input_sample_rate: u32, output_sample_rate: u32, 
 type StreamId = u64;
 
 enum HeapConsSendMsg {
-    Add(StreamId, u32, u32, i32, ringbuf::HeapCons<f32>),
+    Add(StreamId, ResampledBufferedCircularProducer, ringbuf::HeapCons<f32>),
     Remove(StreamId),
     InterruptAll(),
 }
@@ -1601,9 +1607,10 @@ struct OutputStreamAligner {
     heap_cons_sender: mpsc::Sender<HeapConsSendMsg>,
     heap_cons_reciever: mpsc::Receiver<HeapConsSendMsg>,
     input_audio_buffer_producer: BufferedCircularProducer<f32>,
-    input_audio_buffer_consumer: BufferedCircularConsumer<f32>,
+    resample_audio_buffer_producer: ResampledBufferedCircularProducer,
+    resample_audio_buffer_consumer: BufferedCircularConsumer<f32>,
     device_audio_producer: BufferedCircularProducer<f32>,
-    stream_consumers: HashMap<StreamId, BufferedCircularConsumer<f32>>,
+    stream_consumers: HashMap<StreamId, (ResampledBufferedCircularProducer, BufferedCircularConsumer<f32>)>,
     cur_stream_id: Arc<AtomicU64>,
 }
 
@@ -1614,13 +1621,22 @@ impl OutputStreamAligner {
         // used to send across threads
         let (heap_cons_sender, heap_cons_reciever) = mpsc::channel::<HeapConsSendMsg>();
         let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * device_sample_rate) as usize).split();
+        let (resampled_audio_buffer_producer, resampled_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * device_sample_rate) as usize).split();
         Ok(Self {
             device_sample_rate: device_sample_rate,
             output_sample_rate: output_sample_rate,
             heap_cons_sender: heap_cons_sender,
             heap_cons_reciever: heap_cons_reciever,
             input_audio_buffer_producer: BufferedCircularProducer::new(input_audio_buffer_producer),
-            input_audio_buffer_consumer: BufferedCircularConsumer::new(input_audio_buffer_consumer),
+            resample_audio_buffer_producer: ResampledBufferedCircularProducer::new(
+                device_sample_rate,
+                output_sample_rate,
+                resampler_quality,
+                audio_buffer_seconds,
+                BufferedCircularConsumer::new(input_audio_buffer_consumer),
+                BufferedCircularProducer::new(resampled_audio_buffer_producer)
+            )?,
+            resample_audio_buffer_consumer: BufferedCircularConsumer::new(resampled_audio_buffer_consumer),
             device_audio_producer: BufferedCircularProducer::new(device_audio_producer),
             stream_consumers: HashMap::new(),
             cur_stream_id: Arc::new(AtomicU64::new(0)),
@@ -1631,8 +1647,19 @@ impl OutputStreamAligner {
         // this assigns unique ids in a thread-safe way
         let stream_index = self.cur_stream_id.fetch_add(1, Ordering::Relaxed);
         let (producer, consumer) = HeapRb::<f32>::new((audio_buffer_seconds * sample_rate) as usize).split();
+        let (resampled_producer, resampled_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * self.device_sample_rate) as usize).split();
+
         // send the consumer to the consume thread
-        self.heap_cons_sender.send(HeapConsSendMsg::Add(stream_index, sample_rate, audio_buffer_seconds, resampler_quality, consumer))?;
+        let resampled_producer = ResampledBufferedCircularProducer::new(
+            sample_rate,
+            self.device_sample_rate,
+            resampler_quality,
+            audio_buffer_seconds,
+            BufferedCircularConsumer::<f32>::new(consumer),
+            BufferedCircularProducer::<f32>::new(resampled_producer),
+        )?;
+
+        self.heap_cons_sender.send(HeapConsSendMsg::Add(stream_index, resampled_producer, resampled_consumer))?;
         Ok((stream_index, producer))
     }
 
@@ -1657,10 +1684,10 @@ impl OutputStreamAligner {
     // otherwise you may get skipping if you do not provide audio via enqueue_audio fast enough
     // larger frame sizes will also prevent immediate interruption, as interruption can only happen between each frame
     fn get_chunk_to_read(&mut self, input_frame_size: usize, output_chunk_size: usize) -> Result<&[f32], Box<dyn std::error::Error>> {
-        while self.input_audio_buffer_consumer.available() < output_chunk_size {
+        while self.resample_audio_buffer_consumer.available() < output_chunk_size {
             self.mix_audio_streams(input_frame_size)?;
         }
-        Ok(self.input_audio_buffer_consumer.get_chunk_to_read(output_chunk_size))
+        Ok(self.resample_audio_buffer_consumer.get_chunk_to_read(output_chunk_size))
     }
 
     fn mix_audio_streams(&mut self, input_chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
@@ -1668,8 +1695,8 @@ impl OutputStreamAligner {
         loop {
             match self.heap_cons_reciever.try_recv() {
                 Ok(msg) => match msg {
-                    HeapConsSendMsg::Add(id, sample_rate, audio_buffer_seconds, resampler_quality, cons) => {
-                        self.stream_consumers.insert(id, BufferedCircularConsumer::new(cons));
+                    HeapConsSendMsg::Add(id, resampled_producer, resampled_consumer) => {
+                        self.stream_consumers.insert(id, (resampled_producer, BufferedCircularConsumer::new(resampled_consumer)));
                     }
                     HeapConsSendMsg::Remove(id) => {
                         // remove if present
@@ -1688,9 +1715,9 @@ impl OutputStreamAligner {
         let (need_to_write_input_values, input_buf_write) = self.input_audio_buffer_producer.get_chunk_to_write(input_chunk_size);
         let actual_input_chunk_size = input_buf_write.len();
         input_buf_write.fill(0.0);
-        for (_stream_id, cons) in self.stream_consumers.iter_mut() {
-            cons.resample_all()?; // do resampling of any available data
-            let buf_from_stream = cons.get_chunk_to_read(actual_input_chunk_size);
+        for (_stream_id, (resample_producer, resample_consumer)) in self.stream_consumers.iter_mut() {
+            resample_producer.resample_all()?; // do resampling of any available data
+            let buf_from_stream = resample_consumer.get_chunk_to_read(actual_input_chunk_size);
             let samples_to_mix = buf_from_stream.len().min(actual_input_chunk_size);
             if samples_to_mix == 0 {
                 continue;
@@ -1705,7 +1732,7 @@ impl OutputStreamAligner {
                 *dst += src;
             }
             
-            cons.finish_read(samples_to_mix);
+            resample_consumer.finish_read(samples_to_mix);
         }
         // send mixed values to the output device
         let (need_to_write_device_values, device_buf_write) = self.device_audio_producer.get_chunk_to_write(actual_input_chunk_size);
@@ -1717,7 +1744,7 @@ impl OutputStreamAligner {
         self.input_audio_buffer_producer.finish_write(need_to_write_input_values, actual_input_chunk_size);
         
         // resample any available data
-        self.input_audio_buffer_consumer.resample_all()?;
+        self.resample_audio_buffer_producer.resample_all()?;
         Ok(())
     }
 }
@@ -1779,7 +1806,7 @@ fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &Aec
     let mut aligner_consumers = Vec::new();
 
     for channel in 0..device_config.channels {
-        let (producer, resampler, consumer) = create_input_stream_aligner(
+        let (producer, mut resampler, consumer) = create_input_stream_aligner(
             device_config.sample_rate,
             aec_config.target_sample_rate,
             device_config.history_len,
@@ -1789,7 +1816,7 @@ fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &Aec
         aligner_producers.push(producer);
 
         // start the resampler thread
-        thread::spawn({
+        thread::spawn(move || {
             // it returns true when signaled to stop (such as when consumer goes out of scope)
             loop {
                 match resampler.resample() {
@@ -1859,10 +1886,10 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
 }
 
 enum DeviceUpdateMessage {
-    AddInputDevice(InputDeviceConfig, Stream, Vec<InputStreamAlignerConsumer>),
-    RemoveInputDevice(InputDeviceConfig),
-    AddOutputDevice(OutputDeviceConfig, Stream, Vec<OutputStreamAligner>),
-    RemoveOutputDevice(OutputDeviceConfig)
+    AddInputDevice(String, Stream, Vec<InputStreamAlignerConsumer>),
+    RemoveInputDevice(String),
+    AddOutputDevice(String, Stream, Vec<OutputStreamAligner>),
+    RemoveOutputDevice(String)
 }
 
 struct AecStream {
@@ -1945,7 +1972,7 @@ impl AecStream {
         self.input_audio_buffer.clear();
         self.input_audio_buffer.resize(self.input_channels, 0 as i16);
         self.output_audio_buffer.clear();
-        self.output_audio_buffer.resize(self.output_channels, 0 as i16)
+        self.output_audio_buffer.resize(self.output_channels, 0 as i16);
         self.aec_audio_buffer.clear();
         self.aec_audio_buffer.resize(self.input_channels, 0 as i16);
         Ok(())
@@ -1953,83 +1980,78 @@ impl AecStream {
 
     fn add_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
         let (stream, aligners) = get_input_stream_aligners(config, &self.aec_config)?;
-        self.device_update_sender.send(DeviceUpdateMessage::AddInputDevice(config.clone(), stream, aligners))?;
+        self.device_update_sender.send(DeviceUpdateMessage::AddInputDevice(config.device_name.clone(), stream, aligners))?;
         Ok(())
     }
 
     fn add_output_device(&mut self, config: &OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
         let (stream, aligners) = get_output_stream_aligners(config, &self.aec_config)?;
-        self.device_update_sender.send(DeviceUpdateMessage::AddOutputDevice(config.clone(), stream, aligners))?;
+        self.device_update_sender.send(DeviceUpdateMessage::AddOutputDevice(config.device_name.clone(), stream, aligners))?;
         Ok(())
     }
 
     fn remove_input_device(&mut self, config: &InputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        self.device_update_sender.send(DeviceUpdateMessage::RemoveInputDevice(config.clone()))?;
+        self.device_update_sender.send(DeviceUpdateMessage::RemoveInputDevice(config.device_name.clone()))?;
         Ok(())
     }
 
     fn remove_output_device(&mut self, config: &OutputDeviceConfig) -> Result<(), Box<dyn std::error::Error>> {
-        self.device_update_sender.send(DeviceUpdateMessage::RemoveOutputDevice(config.clone()))?;
+        self.device_update_sender.send(DeviceUpdateMessage::RemoveOutputDevice(config.device_name.clone()))?;
         Ok(())
     }
 
-    fn update(&self, chunk_size: usize) {
+    fn update(&self, chunk_size: usize) -> Result<(), Box<dyn std::error::Error>> {
         let start_micros = if let Some(start_micros_value) = self.start_micros {
             start_micros_value
         } else {
             let start_micros_value = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock went backwards").as_micros() - frames_to_micros(chunk_size as u128, self.aec_config.target_sample_rate as u128);
             self.start_micros = Some(start_micros_value);
             start_micros_value
-        }
+        };
         let chunk_start_micros = frames_to_micros(self.total_frames_emitted, self.aec_config.target_sample_rate as u128) + start_micros;
         let chunk_end_micros = chunk_start_micros + frames_to_micros(chunk_size as u128, self.aec_config.target_sample_rate as u128);
         self.total_frames_emitted += chunk_size as u128;
         // todo: move to crossbeam to avoid mpsc locks
         loop {
             match self.device_update_receiver.try_recv() {
-                Ok(msg) => {
-                    Ok(msg) => match msg {
-                        DeviceUpdateMessage::AddInputDevice(config, stream, aligners) {
-                            if let Some(stream) = self.input_streams.get(&config.device_name) {
-                                stream.pause()?;
-                            }
-                            self.input_streams.insert(config.device_name.clone(), stream);
-                            self.input_aligners_in_progress.insert(config.device_name.clone(), aligners);
-                            self.input_aligners.insert(config.device_name.clone(), Vec::new());
-
-                            self.reinitialize_aec();
-                            Ok(())
+                Ok(msg) => match msg {
+                    DeviceUpdateMessage::AddInputDevice(device_name, stream, aligners) => {
+                        if let Some(stream) = self.input_streams.get(&device_name) {
+                            stream.pause()?;
                         }
-                        DeviceUpdateMessage::RemoveInputDevice(config) {
-                            if let Some(stream) = self.input_streams.get(&config.device_name) {
-                                stream.pause()?;
-                            }
-                            self.input_streams.remove(&config.device_name);
-                            self.input_aligners.remove(&config.device_name);
-                            self.input_aligners_in_progress.remove(&config.device_name);
+                        self.input_streams.insert(device_name.clone(), stream);
+                        self.input_aligners_in_progress.insert(device_name.clone(), aligners);
+                        self.input_aligners.insert(device_name.clone(), Vec::new());
 
-                            self.reinitialize_aec();
-                            Ok(())
+                        self.reinitialize_aec();
+                    }
+                    DeviceUpdateMessage::RemoveInputDevice(device_name) => {
+                        if let Some(stream) = self.input_streams.get(&device_name) {
+                            stream.pause()?;
                         }
-                        DeviceUpdateMessage::AddOutputDevice(config, stream, aligners) {
-                            if let Some(stream) = self.output_streams.get(&config.device_name) {
-                                stream.pause()?;
-                            }
-                            self.output_streams.insert(config.device_name.clone(), stream);
-                            self.output_aligners.insert(config.device_name.clone(), aligners);
+                        self.input_streams.remove(&device_name);
+                        self.input_aligners.remove(&device_name);
+                        self.input_aligners_in_progress.remove(&device_name);
 
-                            self.reinitialize_aec();
-                            Ok(())
+                        self.reinitialize_aec();
+                    }
+                    DeviceUpdateMessage::AddOutputDevice(device_name, stream, aligners) => {
+                        if let Some(stream) = self.output_streams.get(&device_name) {
+                            stream.pause()?;
                         }
-                        DeviceUpdateMessage::RemoveOutputDevice(config) {
-                            if let Some(stream) = self.output_streams.get(&config.device_name) {
-                                stream.pause()?;
-                            }
-                            self.output_streams.remove(&config.device_name);
-                            self.output_aligners.remove(&config.device_name);
+                        self.output_streams.insert(device_name.clone(), stream);
+                        self.output_aligners.insert(device_name.clone(), aligners);
 
-                            self.reinitialize_aec();
+                        self.reinitialize_aec();
+                    }
+                    DeviceUpdateMessage::RemoveOutputDevice(device_name) => {
+                        if let Some(stream) = self.output_streams.get(&device_name) {
+                            stream.pause()?;
                         }
+                        self.output_streams.remove(&device_name);
+                        self.output_aligners.remove(&device_name);
+
+                        self.reinitialize_aec();
                     }
                 }
                 Err(TryRecvError::Empty) => {
@@ -2046,12 +2068,14 @@ impl AecStream {
         // we may not get any audio for a little bit
         // won't get 
         if chunk_size == 0 {
-            return;
+            return Ok(());
         }
-        let Some(aec) = self.aec.as_mut() else { return };
+        let Some(aec) = self.aec.as_mut() else { 
+            return Err("no aec").into();
+        };
         if self.output_channels == 0 {
             // todo: simply pass through input_channels, no need for aec
-            return;
+            return Ok(());
         }
 
         // initialize any new aligners and align them to our frame step
@@ -2064,13 +2088,13 @@ impl AecStream {
                     // returns true and skips ahead once it is calibrated and ready
                     if aligner.is_ready_to_read(chunk_end_micros, chunk_size) {
                         remove_indices.push(index);
-                        finished_aligners.push(aligner);
+                        finished_aligners.push(*aligner);
                     }
                 }
                 if let Some(ready_aligners) = self.input_aligners.get_mut(key) {
-                    for remove_index, finished_aligner in remove_indices.iter().zip(finished_aligners.iter()) {
-                        aligners_in_progress.remove(remove_index);
-                        self.input_aligners.push(ready_aligners);
+                    for (remove_index, finished_aligner) in remove_indices.iter().zip(finished_aligners.iter()) {
+                        aligners_in_progress.remove(*remove_index);
+                        ready_aligners.push(*finished_aligner);
                         modified_aligners = true;
                     }
                 }
@@ -2110,6 +2134,8 @@ impl AecStream {
                 // todo: set output_audio_buffer values to 0 for this channel
             };
         }
+
+        Ok(())
         // todo: send input_audio_buffer and output_audio_buffer in self.aec
     }
     fn write_channel_from_f32(
