@@ -32,7 +32,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, TryRecvError},
+        mpsc::{self, TryRecvError, RecvError},
         Arc,
         Mutex,
     },
@@ -946,7 +946,7 @@ fn output_to_input_frames(output_frames: u128, in_rate: u32, out_rate: u32) -> u
     ((output_frames * (in_rate as u128)) / (out_rate as u128)) as u128
 }
 
-fn micros_to_frames(microseconds: i128, sample_rate: i128) -> i128 {
+fn micros_to_frames(microseconds: u128, sample_rate: u128) -> u128 {
     // There are sample_rate samples per second
     // there are sample_rate / 1_000_000 samples per microsecond
     // now that we have samples_per_microsecond, we simply multiply by microseconds to get total samples
@@ -1411,7 +1411,7 @@ struct InputStreamAlignerConsumer {
     sample_rate: u32,
     final_audio_buffer_consumer: BufferedCircularConsumer<f32>,
     thread_message_sender: mpsc::Sender<AudioBufferMetadata>,
-    finished_message_reciever: mpsc::Reciever<ResamplingMetadata>,
+    finished_message_reciever: mpsc::Receiver<ResamplingMetadata>,
     initial_metadata: Vec<ResamplingMetadata>,
     samples_recieved: u128,
     calibrated: bool,
@@ -1467,16 +1467,16 @@ impl InputStreamAlignerConsumer {
         // we need to skip ahead to be frame aligned
         if self.calibrated {
             let num_samples_that_are_behind_current_packet = self.num_samples_that_are_behind_current_packet(micros_packet_finished, size);
-            let available_samples = self.samples_recieved as i128 - (num_samples_behind_current_packet as i128);
+            let available_samples = self.samples_recieved as i128 - (num_samples_that_are_behind_current_packet as i128);
             
             if available_samples < size as i128 {
                 // we will be able to get all samples for this packet, block until we get them
-                if num_samples_behind_current_packet > 0 {
+                if num_samples_that_are_behind_current_packet > 0 {
                     // skip ahead so we are only getting samples for this packet
                     self.final_audio_buffer_consumer.finish_read(num_samples_that_are_behind_current_packet);
                     let additional_samples_needed = (size as i128) - available_samples;
                     read_success, samples = get_chunk_to_read(additional_samples_needed as usize);
-                    true // we will read them again later
+                    true // we will read them again later, at which point we will do finish_read
                 }
                 // we started in the middle of this packet, we can't get enough, wait until next packet
                 else {
@@ -1485,7 +1485,7 @@ impl InputStreamAlignerConsumer {
             }
             else {
                 // enough samples! ignore the ones we need to ignore and then let the sampling happen elsewhere
-                self.final_audio_buffer_consumer.finish_read(num_samples_that_are_behind_current_packet);
+                self.final_audio_buffer_consumer.finish_read(num_samples_that_are_behind_current_packet as usize);
                 true
             }
         } else {
@@ -1493,25 +1493,25 @@ impl InputStreamAlignerConsumer {
         }
     }
 
-    fn num_samples_that_are_behind_current_packet(&self, micros_packet_finished: u128, size: usize) -> {
-        let micros_packet_started = micros_packet_finished - frames_to_micros(size, self.sample_rate);
-        let mut samples_to_ignore = 0;
+    fn num_samples_that_are_behind_current_packet(&self, micros_packet_finished: u128, size: usize) -> u128 {
+        let micros_packet_started = micros_packet_finished - frames_to_micros(size as u128, self.sample_rate as u128);
+        let mut samples_to_ignore = 0 as u128;
         for metadata in self.initial_metadata.iter() {
             match metadata {
                 ResamplingMetadata::Arrive(frames_recieved, micros_metadata_finished, calibrated) => {
-                    let micros_metadata_started = micros_metadata_finished - frames_to_micros(frames_recieved, self.sample_rate);
+                    let micros_metadata_started = *micros_metadata_finished - frames_to_micros(*frames_recieved as u128, self.sample_rate as u128);
                     // whole packet is behind, ignore entire thing
-                    if micros_metadata_finished < micros_packet_started {
-                        samples_to_ignore += frames_recieved;
+                    if *micros_metadata_finished < micros_packet_started {
+                        samples_to_ignore += *frames_recieved as u128;
                     }
                     // keep all data
                     else if micros_metadata_started >= micros_packet_started{
                         
                     } 
-                    // it overlaps, only keep stuff before this packet
+                    // it overlaps, only ignore stuff before this packet
                     else {
                         let micros_ignoring = micros_packet_started - micros_metadata_started;
-                        samples_to_ignore += micros_to_frames(micros_ignoring, self.sample_rate) - 1; // 1 for rounding, to avoid always throwing stuff out
+                        samples_to_ignore += micros_to_frames(micros_ignoring as u128, self.sample_rate as u128);
                     }
 
                 }
@@ -1859,10 +1859,10 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
 }
 
 enum DeviceUpdateMessage {
-    AddInputDevice(&InputDeviceConfig, Stream, Vec<InputStreamAlignerConsumer>),
-    RemoveInputDevice(&InputDeviceConfig),
-    AddOutputDevice(&OutputDeviceConfig, Stream, Vec<OutputStreamAligner>),
-    RemoveOutputDevice(&OutputDeviceConfig)
+    AddInputDevice(InputDeviceConfig, Stream, Vec<InputStreamAlignerConsumer>),
+    RemoveInputDevice(InputDeviceConfig),
+    AddOutputDevice(OutputDeviceConfig, Stream, Vec<OutputStreamAligner>),
+    RemoveOutputDevice(OutputDeviceConfig)
 }
 
 struct AecStream {
