@@ -935,14 +935,14 @@ where
 
 
 
-fn input_to_output_frames(input_frames: i128, in_rate: u32, out_rate: u32) -> i128 {
+fn input_to_output_frames(input_frames: u128, in_rate: u32, out_rate: u32) -> u128 {
     // u128 to avoid overflow
-    (((input_frames as i128) * (out_rate as i128)) / (in_rate as i128)) as i128
+    ((input_frames * (out_rate as u128)) / (in_rate as u128))
 }
 
-fn output_to_input_frames(output_frames: i128, in_rate: u32, out_rate: u32) -> i128 {
+fn output_to_input_frames(output_frames: u128, in_rate: u32, out_rate: u32) -> u128 {
     // u128 to avoid overflow
-    (((output_frames as i128) * (in_rate as i128)) / (out_rate as i128)) as i128
+    ((output_frames * (in_rate as u128)) / (out_rate as u128)) as u128
 }
 
 fn micros_to_frames(microseconds: i128, sample_rate: i128) -> i128 {
@@ -1301,10 +1301,9 @@ struct InputStreamAlignerResampler {
     dynamic_output_sample_rate: u32,
     input_audio_buffer_consumer: BufferedCircularConsumer,
     input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>,
-    total_emitted_frames: i128,
-    total_received_frames: i128,
-    total_processed_input_frames: i128,
-    start_time_micros: u128,
+    total_emitted_frames: u128,
+    total_received_frames: u128,
+    total_processed_input_frames: u128,
     finished_resampling_producer: mpsc::Sender<ResamplingMetadata>
 }
 
@@ -1321,7 +1320,7 @@ impl InputStreamAlignerResampler {
         input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>
         output_audio_buffer_producer: HeapProd<f32>,
         finished_resampling_producer: mpsc::Sender<ResamplingMetadata>
-    ) -> Result<Self, Box<dyn Error>>  {
+    ) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
@@ -1341,7 +1340,6 @@ impl InputStreamAlignerResampler {
             total_received_frames: 0,
             total_processed_input_frames: 0,
             finished_resampling_producer: finished_resampling_producer,
-            start_time_micros: None,
         })
     }
 
@@ -1377,18 +1375,18 @@ impl InputStreamAlignerResampler {
 
         // the main downside of this is that it'll be persistently behind by 0.6ms or so (the resample frame size), but we'll quickly adjust for that so this shouldn't be a major issue
         // todo: think about how to fix this better (maybe current solution is as good as we can do, and it should average out to correct since past ones accumulated will result in more for this one, still, it's likely to stay behind by this amount)
-        self.total_emitted_frames += produced as i128;
+        self.total_emitted_frames += produced as u128;
 
         Ok((consumed, produced))
     }
 
     fn resample(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
         // process all recieved audio chunks
-        match self.heap_cons_reciever.recv() {
+        match self.input_audio_buffer_metadata_consumer.recv() {
             Ok(msg) => match msg {
                 AudioBufferMetadata::Arrive(num_available_frames, system_micros_after_packet_finishes, target_emitted_frames, calibrated) => {
                     let num_leftovers_from_prev = self.total_received_frames - self.total_processed_input_frames;
-                    self.total_received_frames += num_available_frames;
+                    self.total_received_frames += num_available_frames as u128;
                     // if it hypothetically consumed all frames every time,
                     // then we would know that current time in system_micros_after_packet_finishes
                     // however, there are a few things that happen:
@@ -1406,11 +1404,11 @@ impl InputStreamAlignerResampler {
                     true
                 },
                 AudioBufferMetadata::Teardown() => {
-                    false
+                    Ok(false)
                 }
             },
-            Err(TryRecvError::Empty) => true,          // nothing waiting; continue processing
-            Err(TryRecvError::Disconnected) => false,   // sender dropped; bail out or log
+            Err(RecvError::Empty) => Ok(true),          // nothing waiting; continue processing
+            Err(RecvError::Disconnected) => Err("input metadata channel disconnected".into()),   // sender dropped; bail out or log
         }
     }
 }
@@ -1426,12 +1424,14 @@ struct InputStreamAlignerConsumer {
 }
 
 impl InputStreamAlignerConsumer {
-    fn new(sample_rate: u32, final_audio_buffer_consumer: BufferedCircularConsumer<f32>, thread_message_sender: mpsc::Sender<AudioBufferMetadata>, finished_message_reciever: mpsc::Receiver<ResamplingMetadata>) {
+    fn new(sample_rate: u32, final_audio_buffer_consumer: BufferedCircularConsumer<f32>, thread_message_sender: mpsc::Sender<AudioBufferMetadata>, finished_message_reciever: mpsc::Receiver<ResamplingMetadata>) -> Self {
         Self {
             sample_rate: sample_rate,
             final_audio_buffer_consumer: final_audio_buffer_consumer,
             thread_message_sender: thread_message_sender,
             finished_message_reciever: finished_message_reciever,
+            initial_metadata: Vec::new(),
+            samples_recieved: 0,
             calibrated: false,
         }
     }
@@ -1455,7 +1455,7 @@ impl InputStreamAlignerConsumer {
                         ResamplingMetadata::Arrive(frames_recieved, system_micros_after_packet_finishes, calibrated) => {
                             self.calibrated = calibrated;
                             self.initial_metadata.push(msg.clone());
-                            self.samples_recieved += frames_recieved;
+                            self.samples_recieved += frames_recieved as u128;
                         }
                     }
                 }
@@ -1473,15 +1473,15 @@ impl InputStreamAlignerConsumer {
         // we need to skip ahead to be frame aligned
         if self.calibrated {
             let num_samples_that_are_behind_current_packet = self.num_samples_that_are_behind_current_packet(micros_packet_finished, size);
-            let available_samples = self.samples_recieved - num_samples_behind_current_packet;
+            let available_samples = self.samples_recieved as i128 - (num_samples_behind_current_packet as i128);
             
-            if available_samples < size {
+            if available_samples < size as i128 {
                 // we will be able to get all samples for this packet, block until we get them
                 if num_samples_behind_current_packet > 0 {
                     // skip ahead so we are only getting samples for this packet
                     self.final_audio_buffer_consumer.finish_read(num_samples_that_are_behind_current_packet);
-                    let additional_samples_needed = size - available_samples;
-                    read_success, samples = get_chunk_to_read(additional_samples_needed);
+                    let additional_samples_needed = (size as i128) - available_samples;
+                    read_success, samples = get_chunk_to_read(additional_samples_needed as usize);
                     true // we will read them again later
                 }
                 // we started in the middle of this packet, we can't get enough, wait until next packet
