@@ -1299,7 +1299,7 @@ struct InputStreamAlignerResampler {
     input_sample_rate: u32,
     output_sample_rate: u32,
     dynamic_output_sample_rate: u32,
-    input_audio_buffer_consumer: ResampledBufferedCircularConsumer,
+    input_audio_buffer_consumer: BufferedCircularConsumer,
     input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>,
     total_emitted_frames: i128,
     total_received_frames: i128,
@@ -1472,43 +1472,58 @@ impl InputStreamAlignerConsumer {
 
         // we need to skip ahead to be frame aligned
         if self.calibrated {
-            let micros_packet_started = micros_packet_finished - frames_to_micros(size, self.sample_rate);
-            let mut samples_to_ignore = 0;
-            for metadata in self.initial_metadata.iter() {
-                match metadata {
-                    ResamplingMetadata::Arrive(frames_recieved, micros_metadata_finished, calibrated) => {
-                        let micros_metadata_started = micros_metadata_finished - frames_to_micros(frames_recieved, self.sample_rate);
-                        // whole packet is behind, ignore entire thing
-                        if micros_metadata_finished < micros_packet_started {
-                            samples_to_ignore += frames_recieved;
-                        }
-                        // keep all data
-                        else if micros_metadata_started >= micros_packet_started{
-                            
-                        } 
-                        // it overlaps, only keep stuff before this packet
-                        else {
-                            let micros_ignoring = micros_packet_started - micros_metadata_started;
-                            samples_to_ignore += micros_to_frames(micros_ignoring, self.sample_rate) - 1; // 1 for rounding, to avoid always throwing stuff out
-                        }
-
-                    }
-                }
-            }
-            let available_samples = self.samples_recieved - samples_to_ignore;
-            // not enough samples for this chunk (maybe we started in the middle)
-            // return false, and retry next time (we will ignore samples then)
+            let num_samples_that_are_behind_current_packet = self.num_samples_that_are_behind_current_packet(micros_packet_finished, size);
+            let available_samples = self.samples_recieved - num_samples_behind_current_packet;
+            
             if available_samples < size {
-                false
+                // we will be able to get all samples for this packet, block until we get them
+                if num_samples_behind_current_packet > 0 {
+                    // skip ahead so we are only getting samples for this packet
+                    self.final_audio_buffer_consumer.finish_read(num_samples_that_are_behind_current_packet);
+                    let additional_samples_needed = size - available_samples;
+                    read_success, samples = get_chunk_to_read(additional_samples_needed);
+                    true // we will read them again later
+                }
+                // we started in the middle of this packet, we can't get enough, wait until next packet
+                else {
+                    false
+                }
             }
             else {
                 // enough samples! ignore the ones we need to ignore and then let the sampling happen elsewhere
-                self.final_audio_buffer_consumer.finish_read(samples_to_ignore);
+                self.final_audio_buffer_consumer.finish_read(num_samples_that_are_behind_current_packet);
                 true
             }
         } else {
             false
         }
+    }
+
+    fn num_samples_that_are_behind_current_packet(&self, micros_packet_finished: u128, size: usize) -> {
+        let micros_packet_started = micros_packet_finished - frames_to_micros(size, self.sample_rate);
+        let mut samples_to_ignore = 0;
+        for metadata in self.initial_metadata.iter() {
+            match metadata {
+                ResamplingMetadata::Arrive(frames_recieved, micros_metadata_finished, calibrated) => {
+                    let micros_metadata_started = micros_metadata_finished - frames_to_micros(frames_recieved, self.sample_rate);
+                    // whole packet is behind, ignore entire thing
+                    if micros_metadata_finished < micros_packet_started {
+                        samples_to_ignore += frames_recieved;
+                    }
+                    // keep all data
+                    else if micros_metadata_started >= micros_packet_started{
+                        
+                    } 
+                    // it overlaps, only keep stuff before this packet
+                    else {
+                        let micros_ignoring = micros_packet_started - micros_metadata_started;
+                        samples_to_ignore += micros_to_frames(micros_ignoring, self.sample_rate) - 1; // 1 for rounding, to avoid always throwing stuff out
+                    }
+
+                }
+            }
+        }
+        samples_to_ignore
     }
 
     // waits until we have at least that much data
@@ -1552,7 +1567,7 @@ fn create_input_stream_aligner(input_sample_rate: u32, output_sample_rate: u32, 
     let (finished_resampling_producer, finished_resampling_consumer) = mpsc::channel::<()>();
 
     let (output_audio_buffer_producer, output_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
-// resampled_consumer: BufferedCircularConsumer::<f32>::new(resampled_consumer))
+    // resampled_consumer: BufferedCircularConsumer::<f32>::new(resampled_consumer))
     // this resamples, designed to run on a seperate thread
     let resampler = InputStreamAlignerResampler::new(
         input_sample_rate,
@@ -1588,9 +1603,9 @@ struct OutputStreamAligner {
     heap_cons_sender: mpsc::Sender<HeapConsSendMsg>,
     heap_cons_reciever: mpsc::Receiver<HeapConsSendMsg>,
     input_audio_buffer_producer: BufferedCircularProducer<f32>,
-    input_audio_buffer_consumer: ResampledBufferedCircularConsumer,
+    input_audio_buffer_consumer: BufferedCircularConsumer,
     device_audio_producer: BufferedCircularProducer<f32>,
-    stream_consumers: HashMap<StreamId, ResampledBufferedCircularConsumer>,
+    stream_consumers: HashMap<StreamId, BufferedCircularConsumer>,
     cur_stream_id: Arc<AtomicU64>,
 }
 
@@ -1607,11 +1622,7 @@ impl OutputStreamAligner {
             heap_cons_sender: heap_cons_sender,
             heap_cons_reciever: heap_cons_reciever,
             input_audio_buffer_producer: BufferedCircularProducer::new(input_audio_buffer_producer),
-            input_audio_buffer_consumer: ResampledBufferedCircularConsumer::new(
-                device_sample_rate,
-                output_sample_rate,
-                resampler_quality,
-                audio_buffer_seconds,
+            input_audio_buffer_consumer: BufferedCircularConsumer::new(
                 BufferedCircularConsumer::new(input_audio_buffer_consumer)
             )?,
             device_audio_producer: BufferedCircularProducer::new(device_audio_producer),
@@ -1662,13 +1673,7 @@ impl OutputStreamAligner {
             match self.heap_cons_reciever.try_recv() {
                 Ok(msg) => match msg {
                     HeapConsSendMsg::Add(id, sample_rate, audio_buffer_seconds, resampler_quality, cons) => {
-                        self.stream_consumers.insert(id, ResampledBufferedCircularConsumer::new(
-                            sample_rate,
-                            self.device_sample_rate,
-                            resampler_quality,
-                            audio_buffer_seconds,
-                            BufferedCircularConsumer::new(cons)
-                        )?);
+                        self.stream_consumers.insert(id, BufferedCircularConsumer::new(cons));
                     }
                     HeapConsSendMsg::Remove(id) => {
                         // remove if present
@@ -1866,7 +1871,12 @@ struct AecStream {
     sorted_input_aligners: Vec<String>,
     sorted_output_aligners: Vec<String>,
     input_channels: usize,
-    output_channels: usize
+    output_channels: usize,
+    start_miros: Option<u128>,
+    total_frames_emitted: u128,
+    input_audio_frame: Vec<i16>,
+    output_audio_frame: Vec<i16>,
+    aec_audio_frame: Vec<i16>,
 }
 
 impl AecStream {
@@ -1891,6 +1901,11 @@ impl AecStream {
            sorted_output_aligners: Vec::new(),
            input_channels: 0,
            output_channels: 0,
+           start_micros: None,
+           total_frames_emitted: 0,
+           input_audio_frame: Vec::new(),
+           output_audio_frame: Vec::New(),
+           aec_audio_frame: Vec::new()
         })
     }
 
@@ -1920,6 +1935,12 @@ impl AecStream {
             self.output_channels,
         );
 
+        self.input_audio_frame.clear();
+        self.input_audio_frame.resize(self.input_channels, 0 as i16);
+        self.output_audio_frame.clear();
+        self.output_audio_frame.resize(self.output_channels, 0 as i16)
+        self.aec_audio_frame.clear();
+        self.aec_audio_frame.resize(self.input_channels, 0 as i16);
         Ok(())
     }
 
@@ -1940,6 +1961,17 @@ impl AecStream {
     }
 
     fn update(&self, chunk_size: usize) {
+        let start_micros = if let Some(start_micros_value) = self.start_micros {
+            start_micros_value
+        } else {
+            let start_micros_value = Instant::now().duration_since(UNIX_EPOCH).as_micros() - frames_to_micros(chunk_size, self.aec_config.target_sample_rate);
+            self.start_micros = Some(start_micros_value);
+            start_micros_value;
+        }
+        let chunk_start_micros = frames_to_micros(self.total_frames_emitted, self.aec_config.target_sample_rate) + start_micros;
+        let chunk_end_micros = chunk_start_micros + frames_to_micros(chunk_size, self.aec_config.target_sample_rate);
+
+        self.total_frames_emitted += start_micros;
         // todo: move to crossbeam to avoid mpsc locks
         loop {
             match receiver.try_recv() {
@@ -2012,16 +2044,32 @@ impl AecStream {
             return;
         }
 
-
+        // initialize any new aligners and align them to our frame step
+        let mut modified_aligners = false;
         for key in &self.sorted_input_aligners {
-            if let Some(aligners_in_progress) = self.input_aligners.get_mut(key) {
-                // final thing todo is to 
+            if let Some(aligners_in_progress) = self.input_aligners_in_progress.get_mut(key) {
+                let finished_aligners = Vec::new();
+                let remove_indices = Vec::new();
+                for (index, aligner) in aligners_in_progress.iter().enumerate() {
+                    // returns true and skips ahead once it is calibrated and ready
+                    if aligner.is_ready_to_read(chunk_end_micros, chunk_size) {
+                        remove_indices.push(index);
+                        finished_aligners.push(aligner);
+                    }
+                }
+                if let Some(ready_aligners) = self.input_aligners.get_mut(key) {
+                    for remove_index, finished_aligner in remove_indices.iter().zip(finished_aligners.iter()) {
+                        aligners_in_progress.remove(remove_index);
+                        self.input_aligners.push(ready_aligners);
+                        modified_aligners = true;
+                    }
+                }
             }
         }
+        if modified_aligners {
+            self.reinitialize_aec();
+        }
 
-        let mut mic_frame = vec![0i16; chunk_size * self.input_channels];
-        let mut spk_frame = vec![0i16; chunk_size * self.output_channels];
-        let mut out_frame = vec![0i16; mic_frame.len()];
         for key in &self.sorted_input_aligners {
             if let Some(channel_aligners) = self.input_aligners.get_mut(key) {
                 for aligner in channel_aligners {
@@ -2029,7 +2077,7 @@ impl AecStream {
                     if ok {
                         Self::write_channel_from_f32(
                             chunk,
-                            mic_channel,
+                            self.input_audio_buffer,
                             self.input_channels,
                             chunk_size,
                             &mut mic_frame,
@@ -2040,9 +2088,6 @@ impl AecStream {
                     }
                     mic_channel += 1;
                 }
-            }
-            else {
-                mic_channel += 1;
             }
         }
 
