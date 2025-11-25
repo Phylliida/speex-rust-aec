@@ -79,6 +79,11 @@ fn frames_to_micros(frames: u128, sample_rate: u128) -> u128 {
     frames * 1000000 / sample_rate // = microseconds
 }
 
+fn frames_to_micros_i(frames: i128, sample_rate: i128) -> i128 {
+    // frames = (microseconds * sample_rate / 1 000 000)
+    // frames * 1_000_000 = microseconds * sample_rate
+    frames * 1000000 / sample_rate // = microseconds
+}
 
 
 /// Producer-side sibling to `BufferedCircularProducer`.
@@ -393,7 +398,7 @@ impl InputStreamAlignerProducer {
             };
 
             // increment afterwards incase num_calibration_packets = 0
-            self.num_packets_recieved += 1 as u64;
+            self.num_packets_recieved += 1;
 
             let metadata = AudioBufferMetadata::Arrive(
                 // num available frames
@@ -517,9 +522,15 @@ impl InputStreamAlignerResampler {
                     // because resampling may operate at some latency
                     let (consumed, produced) = self.handle_metadata(num_available_frames, target_emitted_frames)?;
                     self.total_processed_input_frames += consumed as u128;
-                    let num_of_ours_consumed = (consumed as i128) - (num_leftovers_from_prev as i128);
-                    let num_of_ours_leftover = (num_available_frames as i128) - (num_of_ours_consumed as i128);
-                    let micros_earlier = frames_to_micros(num_of_ours_leftover as u128, self.input_sample_rate as u128) as i128;
+                    let micros_earlier = if consumed > num_leftovers_from_prev {
+                        let num_of_ours_consumed = (consumed as i128) - (num_leftovers_from_prev as i128);
+                        let num_of_ours_leftover = (num_available_frames as i128) - (num_of_ours_consumed as i128);
+                        frames_to_micros(num_of_ours_leftover as u128, self.input_sample_rate as u128) as i128
+                    } else {
+                        // none of ours was consumed, skip back even further
+                        let additional_frames_back = (num_leftovers_from_prev as u128) - (consumed as u128);
+                        frames_to_micros(num_available_frames as u128 + additional_frames_back, self.input_sample_rate as u128) as i128
+                    }
                     let system_micros_after_resampled_packet_finishes = (system_micros_after_packet_finishes as i128) - micros_earlier;
                     self.finished_resampling_producer.send(ResamplingMetadata::Arrive(produced, system_micros_after_resampled_packet_finishes as u128, calibrated))?;
                     Ok(true)
@@ -596,7 +607,7 @@ impl InputStreamAlignerConsumer {
                     self.final_audio_buffer_consumer.finish_read(num_samples_that_are_behind_current_packet as usize);
                     let additional_samples_needed = (size as i128) - available_samples;
                     let (_read_success, _samples) = self.get_chunk_to_read(additional_samples_needed as usize);
-                    true // we will read them again later, at which point we will do finish_read
+                    true // we will read them again later, at which point we will do finish_read (this is delibrate reading them twice)
                 }
                 // we started in the middle of this packet, we can't get enough, wait until next packet
                 else {
@@ -648,7 +659,8 @@ impl InputStreamAlignerConsumer {
             // wait for data to arrive
             match self.finished_message_reciever.recv() {
                 Ok(_data) => {
-
+                    // this is only called after is_ready_to_read returns true (and is no longer used),
+                    // so it's fine to ignore this, we don't use samples_recieved anymore
                 }
                 Err(err) => {
                     eprintln!("channel closed: {err}");
@@ -689,7 +701,7 @@ fn create_input_stream_aligner(input_sample_rate: u32, output_sample_rate: u32, 
 
     let (finished_resampling_producer, finished_resampling_consumer) = mpsc::channel::<ResamplingMetadata>();
 
-    let (output_audio_buffer_producer, output_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * input_sample_rate) as usize).split();
+    let (output_audio_buffer_producer, output_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * output_sample_rate) as usize).split();
     // resampled_consumer: BufferedCircularConsumer::<f32>::new(resampled_consumer))
     // this resamples, designed to run on a seperate thread
     
@@ -1075,6 +1087,9 @@ fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &Aec
         aligner_producers,
     )?;
 
+    // start input stream
+    stream.play()?;
+
     Ok((stream, aligner_consumers))
 }
 
@@ -1119,6 +1134,9 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
         supported_config,
         device_audio_channel_consumers
     )?;
+
+    // start output stream
+    stream.play()?;
 
     Ok((stream, aligners))
 }
@@ -1411,11 +1429,7 @@ impl AecStream {
                 speex_echo_cancellation(
                     aec.as_ptr(),
                     self.input_audio_buffer.as_ptr(),
-                    if self.output_channels == 0 {
-                        std::ptr::null()
-                    } else {
-                        self.output_audio_buffer.as_ptr()
-                    },
+                    self.output_audio_buffer.as_ptr(),
                     self.aec_audio_buffer.as_mut_ptr(),
                 );
             }
