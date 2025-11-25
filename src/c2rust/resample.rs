@@ -3,6 +3,8 @@
 #![allow(unused_mut)]
 #![allow(static_mut_refs)]
 #![allow(unused_unsafe)]
+#![allow(unpredictable_function_pointer_comparisons)]
+#![allow(unused_must_use)]
 
 extern "C" {
     fn calloc(__nmemb: size_t, __size: size_t) -> *mut std::ffi::c_void;

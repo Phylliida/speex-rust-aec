@@ -1,6 +1,8 @@
 #![allow(unused_assignments)]
 #![allow(unused_variables)]
 #![allow(unused_unsafe)]
+#![allow(unused_must_use)]
+
 
 #[repr(C)]
 pub struct _IO_wide_data {

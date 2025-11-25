@@ -24,48 +24,31 @@
 
 use std::{
     thread,
-    collections::{hash_map::Entry, HashMap, VecDeque},
-    env,
+    collections::{HashMap},
     error::Error,
-    ffi::c_void,
-    mem::{self, MaybeUninit},
-    path::{Path, PathBuf},
+    mem::{MaybeUninit},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, TryRecvError, RecvError},
         Arc,
-        Mutex,
     },
-    time::Duration,
 };
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, FromSample, Host, InputCallbackInfo, Sample, SampleFormat, SampleRate, SizedSample,
-    Stream, StreamConfig, StreamInstant, SupportedStreamConfig, SupportedStreamConfigRange,
+    Stream, SupportedStreamConfig,
 };
-use hound::{self, WavSpec};
 use ringbuf::{
-    traits::{Consumer, Observer, Producer, RingBuffer, Split},
+    traits::{Consumer, Producer, RingBuffer, Split},
     HeapCons, HeapProd, HeapRb, LocalRb,
 };
 use ringbuf::storage::Heap;
 use speex_rust_aec::{
-    speex_echo_cancellation, speex_echo_ctl, EchoCanceller, Resampler, SPEEX_ECHO_SET_SAMPLING_RATE,
+    speex_echo_cancellation, EchoCanceller, Resampler,
 };
 
-use std::time::{Instant, UNIX_EPOCH, SystemTime};
-
-
-const DEFAULT_AEC_RATE: u32 = 48_000;
-const RESAMPLER_QUALITY: i32 = 5;
-const STREAM_ALIGNER_HISTORY_LEN: usize = 128;
-const STREAM_ALIGNER_INPUT_BUFFER_SECONDS: u32 = 2;
-const STREAM_ALIGNER_OUTPUT_BUFFER_SECONDS: u32 = 2;
-
-type AecCallback = Box<dyn FnMut(&[i16]) + Send + 'static>;
-
-
+use std::time::{UNIX_EPOCH, SystemTime};
 
 #[inline]
 unsafe fn assume_init_slice_mut<T>(slice: &mut [MaybeUninit<T>]) -> &mut [T] {
@@ -241,7 +224,6 @@ impl ResampledBufferedCircularProducer {
         input_sample_rate: u32,
         output_sample_rate : u32,
         resampler_quality: i32,
-        audio_buffer_seconds: u32,
         consumer: BufferedCircularConsumer<f32>,
         resampled_producer: BufferedCircularProducer<f32>) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
@@ -454,7 +436,6 @@ impl InputStreamAlignerResampler {
     fn new(
         input_sample_rate: u32,
         output_sample_rate: u32,
-        audio_buffer_seconds: u32,
         resampler_quality: i32,
         input_audio_buffer_consumer: HeapCons<f32>,
         input_audio_buffer_metadata_consumer: mpsc::Receiver<AudioBufferMetadata>,
@@ -470,7 +451,6 @@ impl InputStreamAlignerResampler {
                 input_sample_rate,
                 output_sample_rate,
                 resampler_quality,
-                audio_buffer_seconds, 
                 BufferedCircularConsumer::<f32>::new(input_audio_buffer_consumer),
                 BufferedCircularProducer::<f32>::new(output_audio_buffer_producer)
             )?,
@@ -586,7 +566,7 @@ impl InputStreamAlignerConsumer {
             match self.finished_message_reciever.try_recv() {
                 Ok(msg) => {
                     match msg {
-                        ResamplingMetadata::Arrive(frames_recieved, system_micros_after_packet_finishes, calibrated) => {
+                        ResamplingMetadata::Arrive(frames_recieved, _system_micros_after_packet_finishes, calibrated) => {
                             self.calibrated = calibrated;
                             self.initial_metadata.push(msg.clone());
                             self.samples_recieved += frames_recieved as u128;
@@ -638,7 +618,7 @@ impl InputStreamAlignerConsumer {
         let mut samples_to_ignore = 0 as u128;
         for metadata in self.initial_metadata.iter() {
             match metadata {
-                ResamplingMetadata::Arrive(frames_recieved, micros_metadata_finished, calibrated) => {
+                ResamplingMetadata::Arrive(frames_recieved, micros_metadata_finished, _calibrated) => {
                     let micros_metadata_started = *micros_metadata_finished - frames_to_micros(*frames_recieved as u128, self.sample_rate as u128);
                     // whole packet is behind, ignore entire thing
                     if *micros_metadata_finished < micros_packet_started {
@@ -664,10 +644,10 @@ impl InputStreamAlignerConsumer {
     // (or something errors)
     // returns (success, audio_buffer)
     fn get_chunk_to_read(&mut self, size: usize) -> (bool, &[f32]) {
-        while self.final_audio_buffer_consumer.available() <= size {
+        while self.final_audio_buffer_consumer.available() < size {
             // wait for data to arrive
             match self.finished_message_reciever.recv() {
-                Ok(data) => {
+                Ok(_data) => {
 
                 }
                 Err(err) => {
@@ -716,7 +696,6 @@ fn create_input_stream_aligner(input_sample_rate: u32, output_sample_rate: u32, 
     let resampler = InputStreamAlignerResampler::new(
         input_sample_rate,
         output_sample_rate,
-        audio_buffer_seconds,
         resampler_quality,
         input_audio_buffer_consumer,
         input_audio_buffer_metadata_consumer,
@@ -776,7 +755,6 @@ impl OutputStreamAligner {
                 device_sample_rate,
                 output_sample_rate,
                 resampler_quality,
-                audio_buffer_seconds,
                 BufferedCircularConsumer::new(input_audio_buffer_consumer),
                 BufferedCircularProducer::new(resampled_audio_buffer_producer)
             )?,
@@ -798,7 +776,6 @@ impl OutputStreamAligner {
             sample_rate,
             self.device_sample_rate,
             resampler_quality,
-            audio_buffer_seconds,
             BufferedCircularConsumer::<f32>::new(consumer),
             BufferedCircularProducer::<f32>::new(resampled_producer),
         )?;
@@ -807,11 +784,12 @@ impl OutputStreamAligner {
         Ok((stream_index, producer))
     }
 
-    fn enqueue_audio(audio_data: &[f32], mut audio_producer: HeapProd<f32>) {
+    fn enqueue_audio(audio_data: &[f32], mut audio_producer: HeapProd<f32>) -> HeapProd<f32> {
         let num_pushed = audio_producer.push_slice(audio_data);
         if num_pushed < audio_data.len() {
             eprintln!("Error: output audio buffer got behind, try increasing buffer size");
         }
+        audio_producer
     }
 
     fn end_audio_stream(&self, stream_index: StreamId) -> Result<(), Box<dyn Error>> {
@@ -1062,7 +1040,7 @@ fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &Aec
     let mut aligner_producers = Vec::new();
     let mut aligner_consumers = Vec::new();
 
-    for channel in 0..device_config.channels {
+    for _channel in 0..device_config.channels {
         let (producer, mut resampler, consumer) = create_input_stream_aligner(
             device_config.sample_rate,
             aec_config.target_sample_rate,
@@ -1121,7 +1099,7 @@ fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &A
     
     let mut aligners = Vec::<OutputStreamAligner>::new();
     let mut device_audio_channel_consumers = Vec::new();
-    for channel in 0..device_config.channels {
+    for _channel in 0..device_config.channels {
         let (device_audio_producer, device_audio_consumer) = HeapRb::<f32>::new((device_config.audio_buffer_seconds * device_config.sample_rate) as usize).split();
         let aligner = OutputStreamAligner::new(
             device_config.sample_rate,
@@ -1327,7 +1305,8 @@ impl AecStream {
                 }
                 Err(TryRecvError::Disconnected) => {
                     // sender dropped; receiver will never get more messages
-                    // todo: add error
+                    eprintln!("Error: Stream message send disconnected");
+                    break;
                 }
             } 
         }
@@ -1402,7 +1381,7 @@ impl AecStream {
         else {
             let mut output_channel = 0;
             self.output_audio_buffer.fill(0 as i16);
-            for (output_i, output_key) in self.sorted_output_aligners.iter().enumerate() {
+            for (_output_i, output_key) in self.sorted_output_aligners.iter().enumerate() {
                 if let Some(output_aligners) = self.output_aligners.get_mut(output_key) {
                     for output_aligner in output_aligners.iter_mut() {
                         let samples_used = {
@@ -1447,7 +1426,7 @@ impl AecStream {
             *out = f32::from_sample(*sample);
         }
 
-        Ok(&self.aec_out_audio_buffer.as_slice())
+        Ok(self.aec_out_audio_buffer.as_slice())
     }
     fn write_channel_from_f32(
         src: &[f32],
@@ -1532,9 +1511,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     stream.add_input_device(&input_device_config)?;
     stream.add_output_device(&output_device_config)?;
 
-    for i in 0..1000 {
-        let _samples = stream.update();
+    for _i in 0..1000 {
+        let _samples = stream.update()?;
     }
+    stream.remove_input_device(&input_device_config)?;
+    stream.remove_output_device(&output_device_config)?;
 
 
     Ok(())
@@ -1599,8 +1580,7 @@ fn supported_device_configs_to_string(
 
     Ok(configs
         .iter()
-        .enumerate()
-        .map(|(idx, cfg)| {
+        .map(|cfg| {
             let min_rate = cfg.min_sample_rate().0;
             let max_rate = cfg.max_sample_rate().0;
             let rate_desc = if min_rate == max_rate {
@@ -1655,8 +1635,7 @@ fn find_matching_device_config(
     } else {
         let supported_list = configs
             .iter()
-            .enumerate()
-            .map(|(idx, cfg)| {
+            .map(|cfg| {
                 let min_rate = cfg.min_sample_rate().0;
                 let max_rate = cfg.max_sample_rate().0;
                 let rate_desc = if min_rate == max_rate {
