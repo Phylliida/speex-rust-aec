@@ -1405,7 +1405,7 @@ impl InputStreamAlignerResampler {
                     let num_of_ours_leftover = (num_available_frames as i128) - (num_of_ours_consumed as i128);
                     let micros_earlier = frames_to_micros(num_of_ours_leftover as u128, self.input_sample_rate as u128) as i128;
                     let system_micros_after_resampled_packet_finishes = (system_micros_after_packet_finishes as i128) - micros_earlier;
-                    self.finished_resampling_producer.send(ResamplingMetadata::Arrive(produced, system_micros_after_packet_finishes, calibrated))?;
+                    self.finished_resampling_producer.send(ResamplingMetadata::Arrive(produced, system_micros_after_resampled_packet_finishes as u128, calibrated))?;
                     Ok(true)
                 },
                 AudioBufferMetadata::Teardown() => {
@@ -1437,12 +1437,6 @@ impl InputStreamAlignerConsumer {
             initial_metadata: Vec::new(),
             samples_recieved: 0,
             calibrated: false,
-        }
-    }
-
-    fn drop(&self) {
-        if let Err(err) = self.thread_message_sender.send(AudioBufferMetadata::Teardown()) {
-            eprintln!("failed to send shutdown signal: {}", err);
         }
     }
 
@@ -1551,6 +1545,14 @@ impl InputStreamAlignerConsumer {
 
     fn finish_read(&mut self, size: usize) -> usize {
         self.final_audio_buffer_consumer.finish_read(size)
+    }
+}
+
+impl Drop for InputStreamAlignerConsumer {
+    fn drop(&mut self) {
+        if let Err(err) = self.thread_message_sender.send(AudioBufferMetadata::Teardown()) {
+            eprintln!("failed to send shutdown signal: {}", err);
+        }
     }
 }
 
@@ -1757,7 +1759,7 @@ impl OutputStreamAligner {
 }
 
 struct InputDeviceConfig {
-    host: Host,
+    host_id: cpal::HostId,
     device_name: String,
     channels: u16,
     sample_rate: u32,
@@ -1774,10 +1776,9 @@ struct InputDeviceConfig {
 }
 
 impl InputDeviceConfig {
-    #[allow(clippy::too_many_arguments)]
     fn new(
-        host: Host,
-        device_name: impl Into<String>,
+        host_id: cpal::HostId,
+        device_name: String,
         channels: u16,
         sample_rate: u32,
         sample_format: SampleFormat,
@@ -1787,8 +1788,8 @@ impl InputDeviceConfig {
         resampler_quality: i32,
     ) -> Self {
         Self {
-            host,
-            device_name: device_name.into(),
+            host_id,
+            device_name: device_name.clone(),
             channels,
             sample_rate,
             sample_format,
@@ -1798,10 +1799,36 @@ impl InputDeviceConfig {
             resampler_quality,
         }
     }
+
+    /// Build a config using the device's default input settings plus caller-provided buffer/resampler tuning.
+    fn from_default(
+        host_id: cpal::HostId,
+        device_name: String,
+        history_len: usize,
+        calibration_packets: u32,
+        audio_buffer_seconds: u32,
+        resampler_quality: i32,
+    ) -> Result<Self, Box<dyn Error>> {
+        let host = cpal::host_from_id(host_id)?;
+        let input_device = select_device(host.input_devices(), &device_name, "Input")?;
+        let default_config = input_device.default_input_config()?;
+
+        Ok(Self::new(
+            host_id,
+            input_device.name()?,
+            default_config.channels(),
+            default_config.sample_rate().0,
+            default_config.sample_format(),
+            history_len,
+            calibration_packets,
+            audio_buffer_seconds,
+            resampler_quality,
+        ))
+    }
 }
 
 struct OutputDeviceConfig {
-    host: Host,
+    host_id: cpal::HostId,
     device_name: String,
     channels: u16,
     sample_rate: u32,
@@ -1818,8 +1845,8 @@ struct OutputDeviceConfig {
 
 impl OutputDeviceConfig {
     fn new(
-        host: Host,
-        device_name: impl Into<String>,
+        host_id: cpal::HostId,
+        device_name: String,
         channels: u16,
         sample_rate: u32,
         sample_format: SampleFormat,
@@ -1828,8 +1855,8 @@ impl OutputDeviceConfig {
         frame_size: u32,
     ) -> Self {
         Self {
-            host,
-            device_name: device_name.into(),
+            host_id,
+            device_name: device_name.clone(),
             channels,
             sample_rate,
             sample_format,
@@ -1837,6 +1864,32 @@ impl OutputDeviceConfig {
             resampler_quality,
             frame_size,
         }
+    }
+
+    /// Build a config using the device's default output settings plus caller-provided buffer/resampler tuning.
+    fn from_default(
+        host_id: cpal::HostId,
+        device_name: String,
+        audio_buffer_seconds: u32,
+        resampler_quality: i32,
+        frame_size_millis: u32,
+    ) -> Result<Self, Box<dyn Error>> {
+        let host = cpal::host_from_id(host_id)?;
+        let output_device = select_device(host.output_devices(), &device_name, "Output")?;
+        let default_config = output_device.default_output_config()?;
+        let sample_rate = default_config.sample_rate().0;
+        let frame_size = micros_to_frames((frame_size_millis as u128)*1000, sample_rate as u128);
+
+        Ok(Self::new(
+            host_id,
+            output_device.name()?,
+            default_config.channels(),
+            default_config.sample_rate().0,
+            default_config.sample_format(),
+            audio_buffer_seconds,
+            resampler_quality,
+            frame_size as u32,
+        ))
     }
 }
 
@@ -1854,8 +1907,9 @@ impl AecConfig {
 
 fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, Vec<InputStreamAlignerConsumer>), Box<dyn std::error::Error>>  {
 
+    let host = cpal::host_from_id(device_config.host_id)?;
     let device = select_device(
-        device_config.host.input_devices(),
+        host.input_devices(),
         &device_config.device_name,
         "Input",
     )?;
@@ -1912,8 +1966,10 @@ fn get_input_stream_aligners(device_config: &InputDeviceConfig, aec_config: &Aec
 
 fn get_output_stream_aligners(device_config: &OutputDeviceConfig, aec_config: &AecConfig) -> Result<(Stream, Vec<OutputStreamAligner>), Box<dyn std::error::Error>> {
 
+    let host = cpal::host_from_id(device_config.host_id)?;
+
     let device = select_device(
-        device_config.host.output_devices(),
+        host.output_devices(),
         &device_config.device_name,
         "Output",
     )?;
@@ -1987,7 +2043,7 @@ impl AecStream {
     fn new(
         aec_config: AecConfig
     ) -> Result<Self, Box<dyn Error>> {
-        if aec_config.target_sample_rate < 0 {
+        if aec_config.target_sample_rate == 0 {
             return Err(format!("Target sample rate is {}, it must be greater than zero.", aec_config.target_sample_rate).into());
         }
         let (device_update_sender, device_update_receiver) = mpsc::channel::<DeviceUpdateMessage>();
@@ -2098,7 +2154,7 @@ impl AecStream {
                         self.input_aligners_in_progress.insert(device_name.clone(), aligners);
                         self.input_aligners.insert(device_name.clone(), Vec::new());
 
-                        self.reinitialize_aec();
+                        self.reinitialize_aec()?;
                     }
                     DeviceUpdateMessage::RemoveInputDevice(device_name) => {
                         if let Some(stream) = self.input_streams.get(&device_name) {
@@ -2108,7 +2164,7 @@ impl AecStream {
                         self.input_aligners.remove(&device_name);
                         self.input_aligners_in_progress.remove(&device_name);
 
-                        self.reinitialize_aec();
+                        self.reinitialize_aec()?;
                     }
                     DeviceUpdateMessage::AddOutputDevice(device_name, stream, aligners) => {
                         if let Some(stream) = self.output_streams.get(&device_name) {
@@ -2117,7 +2173,7 @@ impl AecStream {
                         self.output_streams.insert(device_name.clone(), stream);
                         self.output_aligners.insert(device_name.clone(), aligners);
 
-                        self.reinitialize_aec();
+                        self.reinitialize_aec()?;
                     }
                     DeviceUpdateMessage::RemoveOutputDevice(device_name) => {
                         if let Some(stream) = self.output_streams.get(&device_name) {
@@ -2126,7 +2182,7 @@ impl AecStream {
                         self.output_streams.remove(&device_name);
                         self.output_aligners.remove(&device_name);
 
-                        self.reinitialize_aec();
+                        self.reinitialize_aec()?;
                     }
                 }
                 Err(TryRecvError::Empty) => {
@@ -2172,7 +2228,7 @@ impl AecStream {
         }
 
         if modified_aligners {
-            self.reinitialize_aec();
+            self.reinitialize_aec()?;
         }
 
         let mut input_channel = 0;
@@ -2291,7 +2347,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         (aec_sample_rate * frame_size_ms / 1000) as usize,
         (aec_sample_rate * filter_length_ms / 1000) as usize,
     );
-    let stream = AecStream::new(aec_config);
+    let mut stream = AecStream::new(aec_config)?;
 
     let host_ids = cpal::available_hosts();
     for host_id in host_ids {
@@ -2316,18 +2372,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let host = get_host_by_name("ALSA").unwrap_or_else(cpal::default_host);
-    let input_device = select_device(host.input_devices(), "front:CARD=Beyond,DEV=0", "Input");
-    let default_input_device_config = input_device.default_input_config()?;
-    let input_device = get_device_by_name(host, );
+    let input_device_config = InputDeviceConfig::from_default(
+        host.id(),
+        "front:CARD=Beyond,DEV=0".to_string(),
+        // number of audio chunks to hold in memory, for aligning input devices's values when dropped frames/clock offsets. 100 or so is fine
+        100, // history_len 
+        // number of packets recieved before we start getting audio data
+        // a larger value here will take longer to connect, but result in more accurate timing alignments
+        20, // calibration_packets
+        // how long buffer of input audio to store, should only really need a few seconds as things are mostly streamed
+        20, // audio_buffer_seconds
+        3 // resampler_quality
+    )?;
 
-    
+    let output_device_config = OutputDeviceConfig::from_default(
+        host.id(),
+        "hdmi:CARD=NVidia,DEV=0".to_string(),
+        60*10, // audio_buffer_seconds, 10 minutes (for longer audio you may need longer)
+        3, // resampler_quality
+        3, // frame_size_millis (3 millis of audio per frame)
+    )?;
 
-    let input_device = InputDeviceConfig::from_default()
+    stream.add_input_device(&input_device_config)?;
+    stream.add_output_device(&output_device_config)?;
+
+    for i in 0..1000 {
+        let _samples = stream.update();
+    }
+
 
     Ok(())
 }
-
-fn get_device_by_name()
 
 fn get_host_by_name(target: &str) -> Option<Host> {
     for host_id in cpal::available_hosts() {
@@ -2526,6 +2601,7 @@ where
         .collect::<Vec<_>>();
     
     let device_name = config.device_name.clone();
+    let device_name_inner = config.device_name.clone();
     let channels = config.channels as usize;
     device.build_input_stream(
         &supported_config.config(),
@@ -2550,7 +2626,9 @@ where
                 if buffer.is_empty() {
                     continue;
                 }
-                channel_aligner.process_chunk(buffer.as_slice());
+                if let Err(err) = channel_aligner.process_chunk(buffer.as_slice()) {
+                    eprintln!("Input stream '{device_name_inner}' error when process chunk {err}");
+                }
                 buffer.clear();
             }
         },
