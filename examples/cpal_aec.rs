@@ -468,17 +468,19 @@ impl InputStreamAlignerResampler {
         Ok(())
     }
 
-    fn handle_metadata(&mut self, num_available_frames : u64, target_emitted_input_frames : u128) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    fn handle_metadata(&mut self, num_available_frames : u64, target_emitted_input_frames : u128, calibrated: bool) -> Result<(usize, usize), Box<dyn std::error::Error>> {
         let estimated_emitted_frames = input_to_output_frames(num_available_frames as u128, self.input_sample_rate, self.dynamic_output_sample_rate);
         let updated_total_frames_emitted = self.total_emitted_frames + estimated_emitted_frames;
         let target_emitted_output_frames = input_to_output_frames(target_emitted_input_frames, self.input_sample_rate, self.output_sample_rate);
         // dynamic adjustment to synchronize input devices to global clock:
+        // don't do dynamic adjustment until after calibration, bc it's not gonna drift too much over the course of just a few seconds of calibration data
+        // and that simplifies logic/prevents accumulated error during calibration
         // not enough frames, we need to increase dynamic sample rate (to get more samples)
-        if updated_total_frames_emitted < target_emitted_output_frames {
+        if updated_total_frames_emitted < target_emitted_output_frames && calibrated {
             self.increase_dynamic_sample_rate()?;
         }
         // too many frames, we need to decrease dynamic sample rate (to get less samples)
-        else if updated_total_frames_emitted > target_emitted_output_frames {
+        else if updated_total_frames_emitted > target_emitted_output_frames && calibrated {
             self.decrease_dynamic_sample_rate()?;
         }
 
@@ -507,7 +509,7 @@ impl InputStreamAlignerResampler {
                     // this logic sets the timestamp to be correct relative to last resampled emitted
                     // which is slightly distinct from system_micros_after_packet_finishes
                     // because resampling may operate at some latency
-                    let (consumed, produced) = self.handle_metadata(num_available_frames, target_emitted_frames)?;
+                    let (consumed, produced) = self.handle_metadata(num_available_frames, target_emitted_frames, calibrated)?;
                     self.total_processed_input_frames += consumed as u128;
                     let micros_earlier = if consumed as u128 > num_leftovers_from_prev {
                         let num_of_ours_consumed = (consumed as i128) - (num_leftovers_from_prev as i128);
