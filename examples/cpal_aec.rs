@@ -1971,16 +1971,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         resampler_quality
     )?;
 
+    // enqueues audio samples to be played after each other
     stream_output = stream_output_creator.queue_audio(stream_output, wav_samples.as_slice());
-    println!("Enqueued {} audio samples", wav_samples.len());
     stream_output = stream_output_creator.queue_audio(stream_output, wav_samples.as_slice());
-    println!("Enqueued {} audio samples", wav_samples.len());
+
+    // waits for channels to calibrate
     while stream.num_input_channels() == 0 || stream.num_output_channels() == 0 {
         let (aligned_input, aligned_output, aec_applied) = stream.update_debug()?;
         for &s in aligned_input { in_wav.write_sample(s)?; }
         for &s in aligned_output { out_wav.write_sample(s)?; }
         for &s in aec_applied { aec_wav.write_sample(s)?; }
     }
+
     for _i in 0..1000 {
         let (aligned_input, aligned_output, aec_applied) = stream.update_debug()?;
         for &s in aligned_input { in_wav.write_sample(s)?; }
@@ -1988,11 +1990,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         for &s in aec_applied { aec_wav.write_sample(s)?; }
         println!("Got {} samples", aec_applied.len());
     }
-
+    
+    stream_output_creator.end_audio_stream(_stream_id);
+    
+    stream_output_creator.interrupt_all_streams();
+    
     stream.remove_input_device(&input_device_config)?;
     stream.remove_output_device(&output_device_config)?;
 
-    // after the loop (or let them Drop)
     in_wav.finalize()?;
     out_wav.finalize()?;
     aec_wav.finalize()?;
