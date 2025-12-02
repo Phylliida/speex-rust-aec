@@ -584,7 +584,7 @@ impl StreamAlignerConsumer {
     // we allow some initial calibration time to synchronize the clocks
     // (it needs some extra time because packets can be delayed sometimes 
     // so waiting and min over a history lets us get better estimate)
-    fn is_ready_to_read(&mut self, micros_packet_finished: u128, size: usize) -> bool {
+    fn is_ready_to_read(&mut self, micros_packet_finished: u128, size_in_frames: usize) -> bool {
         // non blocking cause maybe it's just not ready (initialized) yet
         loop {
             match self.finished_message_reciever.try_recv() {
@@ -611,7 +611,6 @@ impl StreamAlignerConsumer {
 
         // we need to skip ahead to be frame aligned
         if self.calibrated {
-            let size_in_frames = size / self.channels;
             let num_frames_that_are_behind_current_packet = self.num_frames_that_are_behind_current_packet(micros_packet_finished, size_in_frames);
             let available_frames = self.frames_recieved as i128 - (num_frames_that_are_behind_current_packet as i128);
             
@@ -631,7 +630,7 @@ impl StreamAlignerConsumer {
             }
             else {
                 // enough samples! ignore the ones we need to ignore and then let the sampling happen elsewhere
-                self.final_audio_buffer_consumer.finish_read(num_frames_that_are_behind_current_packet as usize);
+                self.final_audio_buffer_consumer.finish_read((num_frames_that_are_behind_current_packet * self.channels as u128) as usize);
                 true
             }
         } else {
