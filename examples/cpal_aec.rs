@@ -1336,6 +1336,11 @@ impl AecStream {
         } else {
             None
         };
+        if let Some(aec) = self.aec.as_mut() {
+            aec.set_sampling_rate(self.aec_config.target_sample_rate);
+            let sampling_rate = aec.sampling_rate();
+            println!("Set sampling rate to {sampling_rate}");
+        }
 
         self.input_audio_buffer.clear();
         self.input_audio_buffer.resize(self.aec_config.frame_size * self.input_channels, 0 as i16);
@@ -2021,7 +2026,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // which makes it annoying to check alignments in audacity
     }
 
-    for _i in 0..1000/5 {
+    for _i in 0..1000 {
         let (aligned_input, aligned_output, aec_applied) = stream.update_debug()?;
         for &s in aligned_input { in_wav.write_sample(s)?; }
         for &s in aligned_output { out_wav.write_sample(s)?; }

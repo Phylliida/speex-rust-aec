@@ -139,6 +139,31 @@ impl EchoCanceller {
         }
     }
 
+    /// Update the sampling rate so Speex can tune its internal filters correctly.
+    pub fn set_sampling_rate(&mut self, hz: u32) {
+        let mut val = hz as c_int;
+        unsafe {
+            speex_echo_ctl(
+                self.state,
+                SPEEX_ECHO_SET_SAMPLING_RATE,
+                &mut val as *mut _ as *mut _,
+            );
+        }
+    }
+
+    /// Read back the sampling rate currently configured inside Speex.
+    pub fn sampling_rate(&self) -> u32 {
+        let mut val: c_int = 0;
+        unsafe {
+            speex_echo_ctl(
+                self.state,
+                SPEEX_ECHO_GET_SAMPLING_RATE,
+                &mut val as *mut _ as *mut _,
+            );
+        }
+        val as u32
+    }
+
     /// Raw pointer to the underlying Speex echo state (for advanced use).
     pub fn as_ptr(&self) -> *mut SpeexEchoState {
         self.state
