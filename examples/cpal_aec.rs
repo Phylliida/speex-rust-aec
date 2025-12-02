@@ -497,10 +497,12 @@ impl StreamAlignerResampler {
         // not enough frames, we need to increase dynamic sample rate (to get more samples)
         if updated_total_frames_emitted < target_emitted_output_frames && calibrated {
             self.increase_dynamic_sample_rate()?;
+            // println!("Increase to {0} {updated_total_frames_emitted} {target_emitted_output_frames}", self.dynamic_output_sample_rate)
         }
         // too many frames, we need to decrease dynamic sample rate (to get less samples)
         else if updated_total_frames_emitted > target_emitted_output_frames && calibrated {
             self.decrease_dynamic_sample_rate()?;
+            // println!("Decrease to {0} {updated_total_frames_emitted} {target_emitted_output_frames}", self.dynamic_output_sample_rate)
         }
 
         //// do resampling ////
@@ -621,7 +623,8 @@ impl StreamAlignerConsumer {
                     self.final_audio_buffer_consumer.finish_read((num_frames_that_are_behind_current_packet * self.channels as u128) as usize);
                     let additional_frames_needed = (size_in_frames as i128) - available_frames;
                     let (_read_success, _samples) = self.get_chunk_to_read((additional_frames_needed * self.channels as i128) as usize);
-                    true // we will read them again later, at which point we will do finish_read (this is delibrate reading them twice)
+                    // return _read_success and not true to avoid failed reads clogging up the data
+                    _read_success // we will read them again later, at which point we will do finish_read (this is delibrate reading them twice)
                 }
                 // we started in the middle of this packet, we can't get enough, wait until next packet
                 else {
@@ -1439,30 +1442,30 @@ impl AecStream {
 
         // initialize any new aligners and align them to our frame step
         let mut modified_aligners = false;
-        for key in &self.sorted_input_aligners {
+        for key in self.input_aligners_in_progress.keys().cloned().collect::<Vec<String>>() {
             let ready = self
                 .input_aligners_in_progress
-                .get_mut(key)
+                .get_mut(&key)
                 .map(|a| a.is_ready_to_read(chunk_end_micros, chunk_size))
                 .unwrap_or(false);
 
             if ready {
-                if let Some(aligner) = self.input_aligners_in_progress.remove(key) {
-                    self.input_aligners.insert(key.clone(), aligner);
+                if let Some(aligner) = self.input_aligners_in_progress.remove(&key) {
+                    self.input_aligners.insert(key, aligner);
                     modified_aligners = true;
                 }
             }
         }
-        for key in &self.sorted_output_aligners {
+        for key in self.output_aligners_in_progress.keys().cloned().collect::<Vec<String>>() {
             let ready = self
                 .output_aligners_in_progress
-                .get_mut(key)
+                .get_mut(&key)
                 .map(|a| a.is_ready_to_read(chunk_end_micros, chunk_size))
                 .unwrap_or(false);
 
             if ready {
-                if let Some(aligner) = self.output_aligners_in_progress.remove(key) {
-                    self.output_aligners.insert(key.clone(), aligner);
+                if let Some(aligner) = self.output_aligners_in_progress.remove(&key) {
+                    self.output_aligners.insert(key, aligner);
                     modified_aligners = true;
                 }
             }
@@ -2011,12 +2014,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         for &s in aec_applied { aec_wav.write_sample(s)?; }
     }
 
-    for _i in 0..1000 {
+    for _i in 0..10000 {
         let (aligned_input, aligned_output, aec_applied) = stream.update_debug()?;
         for &s in aligned_input { in_wav.write_sample(s)?; }
         for &s in aligned_output { out_wav.write_sample(s)?; }
         for &s in aec_applied { aec_wav.write_sample(s)?; }
-        println!("Got {} samples", aec_applied.len());
+        //println!("Got {} samples", aec_applied.len());
     }
     
     stream_output_creator.end_audio_stream(_stream_id);
