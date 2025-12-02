@@ -367,8 +367,9 @@ impl StreamAlignerProducer {
             eprintln!("Error: cannot keep up with audio, buffer is full, try increasing audio_buffer_seconds")
         }
         if appended_count > 0 {
+            let appended_frames = appended_count / self.channels;
             // delibrately overwrite once we pass history len, we keep a rolling buffer of last 100 or so
-            self.chunk_sizes.push_overwrite(appended_count);
+            self.chunk_sizes.push_overwrite(appended_frames);
             self.system_time_micros_when_chunk_ended.push_overwrite(micros_when_chunk_received);
 
             // use our estimate to suggest how many frames we should have emitted
@@ -376,7 +377,7 @@ impl StreamAlignerProducer {
             // that ensures that we stay synchronized to the system clock and do not drift
             let micros_when_chunk_ended = self.estimate_micros_when_most_recent_ended();
 
-            self.num_emitted_frames += appended_count as u128;
+            self.num_emitted_frames += appended_frames as u128;
 
             let (target_emitted_frames, calibrated) = if self.num_packets_recieved < self.num_calibration_packets as u64 {
                 // until we've recieved enough calibration packets, we don't have good enough time estimate
@@ -1857,7 +1858,7 @@ where
     device.build_output_stream(
         &supported_config.config(),
         move |data: &mut [T], _| {
-            let frames = data.len();
+            let frames = data.len() / mixer.channels;
             if frames == 0 {
                 return;
             }
@@ -1942,9 +1943,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output_device_config = OutputDeviceConfig::from_default(
         host.id(),
         "hdmi:CARD=NVidia,DEV=0".to_string(),
-        60*10, // audio_buffer_seconds, 10 minutes (for longer audio you may need longer)
+        100, // history_len
         20, // calibration_packets
-        20, // audio_buffer_seconds
+        20, // audio_buffer_seconds, just for resampling (actual audio buffer determined upon begin_audio_stream creation)
         resampler_quality, // resampler_quality
         3, // frame_size_millis (3 millis of audio per frame)
     )?;
@@ -1953,16 +1954,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     let stream_output_creator = stream.add_output_device(&output_device_config)?;
 
     // output wav files for debugging
-    let pcm_spec = WavSpec {
+    let pcm_spec_input = WavSpec {
         channels: input_device_config.channels as u16,
         sample_rate: aec_sample_rate, // 16_000 in your config
         bits_per_sample: 16,
         sample_format: HoundSampleFormat::Int,
     };
-    let aec_spec = WavSpec { sample_format: HoundSampleFormat::Float, bits_per_sample: 32, ..pcm_spec };
 
-    let mut in_wav = WavWriter::create("aligned_input.wav", pcm_spec.clone())?;
-    let mut out_wav = WavWriter::create("aligned_output.wav", pcm_spec)?;
+    let pcm_spec_output = WavSpec {
+        channels: output_device_config.channels as u16,
+        ..pcm_spec_input
+    };    
+    
+    let aec_spec = WavSpec {
+        sample_format: HoundSampleFormat::Float,
+        bits_per_sample: 32,
+        ..pcm_spec_input
+    };
+
+    let mut in_wav = WavWriter::create("aligned_input.wav", pcm_spec_input)?;
+    let mut out_wav = WavWriter::create("aligned_output.wav", pcm_spec_output)?;
     let mut aec_wav = WavWriter::create("aec_applied.wav", aec_spec)?;
 
     // input wav file to output
