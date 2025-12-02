@@ -617,12 +617,13 @@ impl StreamAlignerConsumer {
             let available_frames = self.frames_recieved as i128 - (num_frames_that_are_behind_current_packet as i128);
             
             if available_frames < size_in_frames as i128 {
-                // we will be able to get all samples for this packet, block until we get them
                 if num_frames_that_are_behind_current_packet > 0 {
                     // skip ahead so we are only getting samples for this packet
                     self.final_audio_buffer_consumer.finish_read((num_frames_that_are_behind_current_packet * self.channels as u128) as usize);
                     let additional_frames_needed = (size_in_frames as i128) - available_frames;
+                    // we will be able to get all samples for this packet, block until we get them
                     let (_read_success, _samples) = self.get_chunk_to_read((additional_frames_needed * self.channels as i128) as usize);
+                    println!("Finished calibrate, ignoring {num_frames_that_are_behind_current_packet} frames");
                     // return _read_success and not true to avoid failed reads clogging up the data
                     _read_success // we will read them again later, at which point we will do finish_read (this is delibrate reading them twice)
                 }
@@ -634,6 +635,7 @@ impl StreamAlignerConsumer {
             else {
                 // enough samples! ignore the ones we need to ignore and then let the sampling happen elsewhere
                 self.final_audio_buffer_consumer.finish_read((num_frames_that_are_behind_current_packet * self.channels as u128) as usize);
+                println!("Finished calibrate (2), ignoring {num_frames_that_are_behind_current_packet} frames");
                 true
             }
         } else {
@@ -1439,8 +1441,7 @@ impl AecStream {
         if chunk_size == 0 {
             return Ok(&[]);
         }
-
-        // initialize any new aligners and align them to our frame step
+         // initialize any new aligners and align them to our frame step
         let mut modified_aligners = false;
         for key in self.input_aligners_in_progress.keys().cloned().collect::<Vec<String>>() {
             let ready = self
@@ -1559,6 +1560,12 @@ impl AecStream {
         for (out, sample) in self.aec_out_audio_buffer.iter_mut().zip(aec_output) {
             *out = f32::from_sample(*sample);
         }
+
+        //let timestamp_value = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock went backwards").as_micros();
+        //let diff = (((chunk_end_micros as i128 - timestamp_value as i128) as f32) / 1000.0) / (self.aec_config.target_sample_rate as f32);
+        //let frame_size_seconds = (chunk_size as f32) / (self.aec_config.target_sample_rate as f32);
+        //println!("{diff} chunk_size {frame_size_seconds}");
+     
 
         Ok(self.aec_out_audio_buffer.as_slice())
     }
@@ -1893,7 +1900,7 @@ where
 
 fn main() -> Result<(), Box<dyn Error>> {
     let frame_size_ms = 10;
-    let filter_length_ms = 200;
+    let filter_length_ms = 300;
     let aec_sample_rate = 16000;
     let aec_config = AecConfig::new(
         aec_sample_rate,
@@ -2009,12 +2016,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     // waits for channels to calibrate
     while stream.num_input_channels() == 0 || stream.num_output_channels() == 0 {
         let (aligned_input, aligned_output, aec_applied) = stream.update_debug()?;
-        for &s in aligned_input { in_wav.write_sample(s)?; }
-        for &s in aligned_output { out_wav.write_sample(s)?; }
-        for &s in aec_applied { aec_wav.write_sample(s)?; }
+        // don't write to wav files bc if one device is ready before another,
+        // that device will have more samples written
+        // which makes it annoying to check alignments in audacity
     }
 
-    for _i in 0..1000 {
+    for _i in 0..1000/5 {
         let (aligned_input, aligned_output, aec_applied) = stream.update_debug()?;
         for &s in aligned_input { in_wav.write_sample(s)?; }
         for &s in aligned_output { out_wav.write_sample(s)?; }
