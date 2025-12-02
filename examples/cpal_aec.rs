@@ -34,6 +34,7 @@ use std::{
     },
 };
 
+use std::backtrace::Backtrace;
 
 
 use cpal::{
@@ -99,7 +100,9 @@ impl<T: Copy> BufferedCircularProducer<T> {
             // wrote to scratch, need to add it to producer
             let _appended = self.producer.push_slice(&self.scratch[..num_written]);
             if _appended < num_written {
-                eprintln!("Warning: Producer cannot keep up, increase buffer size or decrease latency")
+                eprintln!("Warning: Producer cannot keep up, increase buffer size or decrease latency");
+                let bt = Backtrace::capture();
+                println!("{bt}");
             }
         } else {
             // wrote directly to producer, simply advance write index
@@ -828,9 +831,8 @@ struct OutputStreamAlignerMixer {
     device_sample_rate: u32,
     output_sample_rate: u32,
     frame_size: u32,
-    input_audio_buffer_producer: BufferedCircularProducer<f32>,
     device_audio_producer: BufferedCircularProducer<f32>,
-    resample_audio_buffer_producer: StreamAlignerProducer,
+    resampled_audio_buffer_producer: StreamAlignerProducer,
     stream_consumers: HashMap<StreamId, (u32, usize, HashMap<usize, usize>, ResampledBufferedCircularProducer, BufferedCircularConsumer<f32>)>,
     output_stream_receiver: mpsc::Receiver<OutputStreamMessage>,
 }
@@ -839,16 +841,14 @@ struct OutputStreamAlignerMixer {
 impl OutputStreamAlignerMixer {
     fn new(channels: usize, device_sample_rate: u32, output_sample_rate: u32, audio_buffer_seconds: u32, resampler_quality: i32, frame_size: u32, output_stream_receiver:  mpsc::Receiver<OutputStreamMessage>, device_audio_producer: HeapProd<f32>, resampled_audio_buffer_producer: StreamAlignerProducer) -> Result<Self, Box<dyn Error>>  {
         // used to send across threads
-        let (input_audio_buffer_producer, input_audio_buffer_consumer) = HeapRb::<f32>::new((audio_buffer_seconds * device_sample_rate *(channels as u32)) as usize).split();
         Ok(Self {
             channels: channels,
             device_sample_rate: device_sample_rate,
             output_sample_rate: output_sample_rate,
             frame_size: frame_size,
-            input_audio_buffer_producer: BufferedCircularProducer::new(input_audio_buffer_producer),
             device_audio_producer: BufferedCircularProducer::new(device_audio_producer),
             output_stream_receiver: output_stream_receiver,
-            resample_audio_buffer_producer: resample_audio_buffer_producer,
+            resampled_audio_buffer_producer: resampled_audio_buffer_producer,
             stream_consumers: HashMap::new(),
         })
     }
@@ -876,10 +876,10 @@ impl OutputStreamAlignerMixer {
             }
         }
 
-        let (need_to_write_input_values, input_buf_write) = self.input_audio_buffer_producer.get_chunk_to_write(input_chunk_size*(self.channels as usize));
-        let actual_input_chunk_size = input_buf_write.len();
-        let frames_cap = input_buf_write.len() / (self.channels);
-        input_buf_write.fill(0.0);
+        let (need_to_write_device_values, device_buf_write) = self.device_audio_producer.get_chunk_to_write(input_chunk_size * self.channels);
+        let actual_input_chunk_size = device_buf_write.len();
+        let frames_cap = device_buf_write.len() / (self.channels);
+        device_buf_write.fill(0.0);
         for (_stream_id, (input_sample_rate, channels, channel_map, resample_producer, resample_consumer)) in self.stream_consumers.iter_mut() {
             let target_input_samples = input_to_output_frames(frames_cap as u128, self.device_sample_rate, *input_sample_rate);
             // this doesn't work because it'll stall for very large audio
@@ -903,7 +903,7 @@ impl OutputStreamAlignerMixer {
                     // just add to mix, do not average or clamp. Average results in too quiet, clamp is non-linear (so confuses eac, which only works with linear transformations), 
                     // (fyi, resample is a linear operation in speex so it's safe to do while using eac)
                     // see this https://dsp.stackexchange.com/a/3603
-                    input_buf_write[dst] += buf_from_stream[src_idx];
+                    device_buf_write[dst] += buf_from_stream[src_idx];
                     dst += dst_stride;
                     src_idx += src_stride;
                 }
@@ -911,16 +911,10 @@ impl OutputStreamAlignerMixer {
             let num_read = frames * (*channels);
             resample_consumer.finish_read(num_read);
         }
-        // send mixed values to the output device
-        let (need_to_write_device_values, device_buf_write) = self.device_audio_producer.get_chunk_to_write(actual_input_chunk_size);
-        let samples_to_copy = device_buf_write.len().min(actual_input_chunk_size);
-        device_buf_write[..samples_to_copy].copy_from_slice(&input_buf_write[..samples_to_copy]);
         // send output downstream to the eac
-        resample_audio_buffer_producer.process_chunk(device_buf_write);
+        self.resampled_audio_buffer_producer.process_chunk(device_buf_write);
         // finish writing to output device buffer
-        self.device_audio_producer.finish_write(need_to_write_device_values, samples_to_copy);
-        // finish writing to the input buffer
-        self.input_audio_buffer_producer.finish_write(need_to_write_input_values, actual_input_chunk_size);
+        self.device_audio_producer.finish_write(need_to_write_device_values, frames_cap * self.channels);
         Ok(())
     }
 }
@@ -1031,7 +1025,7 @@ struct OutputDeviceConfig {
     calibration_packets: u32,
     // how long buffer of input audio to store, should only really need a few seconds as things are mostly streamed
     audio_buffer_seconds: u32,
-    resampler_quality: i32
+    resampler_quality: i32,
     // frame size (in terms of samples) should be small, on the order of 1-2ms or less.
     // otherwise you may get skipping if you do not provide audio via enqueue_audio fast enough
     // larger frame sizes will also prevent immediate interruption, as interruption can only happen between each frame
@@ -1045,19 +1039,23 @@ impl OutputDeviceConfig {
         channels: usize,
         sample_rate: u32,
         sample_format: SampleFormat,
+        history_len: usize,
+        calibration_packets: u32,
         audio_buffer_seconds: u32,
         resampler_quality: i32,
         frame_size: u32,
     ) -> Self {
         Self {
-            host_id,
+            host_id: host_id,
             device_name: device_name.clone(),
-            channels,
-            sample_rate,
-            sample_format,
-            audio_buffer_seconds,
-            resampler_quality,
-            frame_size,
+            channels: channels,
+            sample_rate: sample_rate,
+            sample_format: sample_format,
+            history_len: history_len,
+            calibration_packets: calibration_packets,
+            audio_buffer_seconds: audio_buffer_seconds,
+            resampler_quality: resampler_quality,
+            frame_size: frame_size,
         }
     }
 
@@ -1065,6 +1063,8 @@ impl OutputDeviceConfig {
     fn from_default(
         host_id: cpal::HostId,
         device_name: String,
+        history_len: usize,
+        calibration_packets: u32,
         audio_buffer_seconds: u32,
         resampler_quality: i32,
         frame_size_millis: u32,
@@ -1081,6 +1081,8 @@ impl OutputDeviceConfig {
             default_config.channels() as usize,
             default_config.sample_rate().0,
             default_config.sample_format(),
+            history_len,
+            calibration_packets,
             audio_buffer_seconds,
             resampler_quality,
             frame_size as u32,
@@ -1488,7 +1490,7 @@ impl AecStream {
                     for c in 0..channels {
                         let mut src_idx = c;
                         let mut dst = input_channel + c;
-                        for _ in 0..frames_to_write {
+                        for _ in 0..frames {
                             self.input_audio_buffer[dst] = Self::f32_to_i16(chunk[src_idx]);
                             dst += self.input_channels;
                             src_idx += channels;
@@ -1520,7 +1522,7 @@ impl AecStream {
                         for c in 0..channels {
                             let mut src_idx = c;
                             let mut dst = output_channel + c;
-                            for _ in 0..frames_to_write {
+                            for _ in 0..frames {
                                 self.output_audio_buffer[dst] = Self::f32_to_i16(chunk[src_idx]);
                                 dst += self.output_channels;
                                 src_idx += channels;
@@ -1941,6 +1943,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         host.id(),
         "hdmi:CARD=NVidia,DEV=0".to_string(),
         60*10, // audio_buffer_seconds, 10 minutes (for longer audio you may need longer)
+        20, // calibration_packets
+        20, // audio_buffer_seconds
         resampler_quality, // resampler_quality
         3, // frame_size_millis (3 millis of audio per frame)
     )?;
