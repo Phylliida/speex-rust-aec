@@ -1489,18 +1489,17 @@ impl AecStream {
         Ok(())
     }
 
-    fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer]) -> Result<HashMap<usize, f32>, Box<dyn std::error::Error>> {
+    fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer]) -> Result<(HashMap<usize, f32>, HashMap<String, HashMap<usize, f32>>), Box<dyn std::error::Error>> {
         let sample_rate = self.aec_config.target_sample_rate as f32;
         let tone_ms = 8.0;
-        let tail_ms = 50.0;
         let capture_secs = 3.0;
 
         // 1) Emit a distinct probe on each output device (all channels), in sorted output order.
         let mut active_streams: Vec<(usize, usize, StreamId)> = Vec::new();
-        for idx, dev_name in self.sorted_output_aligners.clone().enumerate() {
+        for (idx, dev_name) in self.sorted_output_aligners.clone().iter().enumerate() {
             let Some(producer) = output_producers
                 .iter_mut()
-                .find(|p| p.device_name == dev_name) else {
+                .find(|p| p.device_name == *dev_name) else {
                 eprintln!("calibrate: no output producer found for '{dev_name}'");
                 continue;
             };
@@ -1524,54 +1523,136 @@ impl AecStream {
             active_streams.push((idx, channels, stream_id));
         }
 
-        // 2) Capture ~3s of aligned input data based on audio timestamps (not wall clock).
-        let mut captured_input: Vec<f32> = Vec::new();
-        let mut captured_output: Vec<f32> = Vec::new();
+        // Build channel ranges for inputs and outputs (interleaved order).
+        let mut input_channel_ranges: Vec<(String, usize, usize)> = Vec::new();
+        let mut in_ch_start = 0usize;
+        for name in &self.sorted_input_aligners {
+            if let Some(aligner) = self.input_aligners.get(name) {
+                input_channel_ranges.push((name.clone(), in_ch_start, aligner.channels));
+                in_ch_start += aligner.channels;
+            }
+        }
+        let mut output_channel_ranges: Vec<(String, usize, usize)> = Vec::new();
+        let mut out_ch_start = 0usize;
+        for name in &self.sorted_output_aligners {
+            if let Some(aligner) = self.output_aligners.get(name) {
+                output_channel_ranges.push((name.clone(), out_ch_start, aligner.channels));
+                out_ch_start += aligner.channels;
+            }
+        }
+
+        // 2) Capture ~3s of aligned input/output data, averaged per device.
+        let mut captured_inputs: Vec<Vec<f32>> = vec![Vec::new(); input_channel_ranges.len()];
+        let mut captured_outputs: Vec<Vec<f32>> = vec![Vec::new(); output_channel_ranges.len()];
         let mut captured_micros: u128 = 0;
-        let target_micros: u128 = ((capture_secs as u128) * 1_000_000.0) as u128;
+        let target_micros: u128 = ((capture_secs as u128) * 1_000_000) as u128;
         while captured_micros < target_micros {
-            let (input_slices, _output_slices, _aec_out, start_time, end_time) = self.update_debug()?;
+            let (input_slices, output_slices, _aec_out, start_time, end_time) = self.update_debug()?;
             let chunk_micros = end_time.saturating_sub(start_time);
-            if !input_slices.is_empty() {
-                captured_input.extend(
-                    input_slices
-                        .iter()
-                        .map(|s| f32::from_sample(*s)),
-                );
+            let total_in_ch = self.input_channels.max(1);
+            if !input_slices.is_empty() && total_in_ch > 0 {
+                let frames = input_slices.len() / total_in_ch;
+                for frame_idx in 0..frames {
+                    let base = frame_idx * total_in_ch;
+                    for (dev_idx, (_name, start_ch, ch_count)) in input_channel_ranges.iter().enumerate() {
+                        let mut acc = 0.0f32;
+                        for ch in 0..*ch_count {
+                            let sample = input_slices[base + start_ch + ch];
+                            acc += f32::from_sample(sample);
+                        }
+                        captured_inputs[dev_idx].push(acc / (*ch_count as f32));
+                    }
+                }
+            }
+            let total_out_ch = self.output_channels.max(1);
+            if !output_slices.is_empty() && total_out_ch > 0 {
+                let frames = output_slices.len() / total_out_ch;
+                for frame_idx in 0..frames {
+                    let base = frame_idx * total_out_ch;
+                    for (dev_idx, (_name, start_ch, ch_count)) in output_channel_ranges.iter().enumerate() {
+                        let mut acc = 0.0f32;
+                        for ch in 0..*ch_count {
+                            let sample = output_slices[base + start_ch + ch];
+                            acc += f32::from_sample(sample);
+                        }
+                        captured_outputs[dev_idx].push(acc / (*ch_count as f32));
+                    }
+                }
             }
             captured_micros += chunk_micros;
         }
 
         // 3) Stop probe streams now that capture is done.
-        for (idx, stream_id) in active_streams {
+        for (idx, _channels, stream_id) in active_streams {
             if let Some(producer) = output_producers.get(idx) {
                 producer.end_audio_stream(stream_id)?;
             }
         }
 
-        // 4) Detect probes and compute offsets relative to output device 0.
-        let detections = detect_probe_tones(&captured_input, self.input_channels.max(1), output_producers.len(), tone_ms, sample_rate);
-        let mut ref_start: Option<usize> = None;
-        let mut starts = HashMap::new();
-        for (dev_idx, start, score) in detections {
-            if dev_idx == 0 {
-                ref_start = Some(start);
+        // 4) Detect probes on outputs to compute offsets relative to output device 0.
+        let mut output_offsets: HashMap<usize, f32> = HashMap::new();
+        if !captured_outputs.is_empty() {
+            // First detect reference on output 0.
+            let mut ref_start: Option<usize> = None;
+            let det_ref = detect_probe_tones(&captured_outputs[0], 1, output_producers.len(), tone_ms, sample_rate);
+            for (dev_idx, start, score) in det_ref {
+                if dev_idx == 0 {
+                    println!("Output probe out#0 at {start} (score {score})");
+                    ref_start = Some(start);
+                    break;
+                }
             }
-            starts.insert(dev_idx, (start, score));
+            if let Some(ref_start) = ref_start {
+                for (dev_idx, buf) in captured_outputs.iter().enumerate() {
+                    let detections = detect_probe_tones(buf, 1, output_producers.len(), tone_ms, sample_rate);
+                    let mut start_for_dev: Option<(usize, f32)> = None;
+                    for (d_idx, start, score) in detections {
+                        if d_idx == dev_idx {
+                            start_for_dev = Some((start, score));
+                            break;
+                        }
+                    }
+                    if let Some((start, score)) = start_for_dev {
+                        let delta_samples = start as i64 - ref_start as i64;
+                        let delta_ms = delta_samples as f32 * 1000.0 / sample_rate;
+                        println!("Output probe out#{dev_idx} at {start} (score {score}), offset_ms={delta_ms}");
+                        output_offsets.insert(dev_idx, delta_ms);
+                    } else {
+                        eprintln!("No probe detected for output device index {dev_idx}");
+                    }
+                }
+            } else {
+                eprintln!("No reference probe detected on outputs; skipping output offsets");
+            }
         }
-        let Some(ref_start) = ref_start else {
-            eprintln!("No reference probe detected; cannot compute offsets");
-            return Ok(HashMap::new());
-        };
 
-        let mut result = HashMap::new();
-        for (dev_idx, (start, score)) in starts {
-            let delta_samples = start as i64 - ref_start as i64;
-            let delta_ms = delta_samples as f32 * 1000.0 / sample_rate;
-            println!("Probe for out#{dev_idx} detected at {start} (score {score}), offset_ms={delta_ms}");
-            result.insert(dev_idx, delta_ms);
+        // 5) Detect probes and compute offsets relative to output device 0, per input device.
+        let mut input_result: HashMap<String, HashMap<usize, f32>> = HashMap::new();
+        for (in_idx, (name, _start_ch, _ch_count)) in input_channel_ranges.iter().enumerate() {
+            let detections = detect_probe_tones(&captured_inputs[in_idx], 1, output_producers.len(), tone_ms, sample_rate);
+            let mut ref_start: Option<usize> = None;
+            let mut starts = HashMap::new();
+            for (dev_idx, start, score) in detections {
+                if dev_idx == 0 {
+                    ref_start = Some(start);
+                }
+                starts.insert(dev_idx, (start, score));
+            }
+            let Some(ref_start) = ref_start else {
+                eprintln!("No reference probe detected for input '{name}'; skipping");
+                continue;
+            };
+
+            let mut offsets = HashMap::new();
+            for (dev_idx, (start, score)) in starts {
+                let delta_samples = start as i64 - ref_start as i64;
+                let delta_ms = delta_samples as f32 * 1000.0 / sample_rate;
+                println!("Input '{name}': probe for out#{dev_idx} at {start} (score {score}), offset_ms={delta_ms}");
+                offsets.insert(dev_idx, delta_ms);
+            }
+            input_result.insert(name.clone(), offsets);
         }
-        Ok(result)
+        Ok((output_offsets, input_result))
     }
 
     // calls update, but returns all involved audio buffers
