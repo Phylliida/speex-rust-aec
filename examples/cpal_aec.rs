@@ -214,7 +214,7 @@ struct ResampledBufferedCircularProducer {
     resampled_producer: BufferedCircularProducer<f32>,
     input_sample_rate: u32,
     output_sample_rate: u32,
-    total_input_samples_remaining: u128,
+    total_input_frames_remaining: u128,
     resampler: Resampler
 }
 
@@ -230,7 +230,7 @@ impl ResampledBufferedCircularProducer {
             channels: channels,
             consumer: consumer,
             resampled_producer: resampled_producer,
-            total_input_samples_remaining: 0,
+            total_input_frames_remaining: 0,
             input_sample_rate: input_sample_rate,
             output_sample_rate: output_sample_rate,
             resampler: Resampler::new(
@@ -259,26 +259,20 @@ fn round_to_channels(frames: u32, channels: usize) -> u32 {
 }
 
 impl ResampledBufferedCircularProducer {
-    // resample all data available
-    fn resample_all(&mut self) -> Result<(usize, usize), Box<dyn std::error::Error>>  {
-        // set this to zero since we just read num samples available from available_to_resample()
-        // which would have double counted below
-        self.total_input_samples_remaining = 0; 
-        self.resample(self.available_to_resample() as u32)
-    }
 
     fn resample(&mut self, num_available_frames: u32) -> Result<(usize, usize), Box<dyn std::error::Error>> {
         if num_available_frames == 0 {
             return Ok((0,0));
         }
 
+        let available_frames = self.available_to_resample() / self.channels;
         // there might be some leftover from last call, so use state
-        self.total_input_samples_remaining = (self.total_input_samples_remaining + num_available_frames as u128).min(self.available_to_resample() as u128);
+        self.total_input_frames_remaining = (self.total_input_frames_remaining + num_available_frames as u128).min(available_frames as u128);
         
         // read in multiples of channels
-        let input_buf = self.consumer.get_chunk_to_read(round_to_channels(self.total_input_samples_remaining as u32, self.channels) as usize);
-        let target_output_samples_count = input_to_output_frames(self.total_input_samples_remaining, self.input_sample_rate, self.output_sample_rate) + ((self.channels*3) as u128); // add a few extra for rounding
-        let (need_to_write_outputs, output_buf) = self.resampled_producer.get_chunk_to_write(round_to_channels(target_output_samples_count as u32, self.channels) as usize);
+        let input_buf = self.consumer.get_chunk_to_read((self.total_input_frames_remaining * (self.channels as u128)) as usize);
+        let target_output_samples_count = input_to_output_frames(self.total_input_frames_remaining, self.input_sample_rate, self.output_sample_rate)*(self.channels as u128); // add a few extra for rounding
+        let (need_to_write_outputs, output_buf) = self.resampled_producer.get_chunk_to_write(target_output_samples_count as usize);
         let (consumed, produced) = self.resampler.process_interleaved_f32(input_buf, output_buf)?;
         // it may return less consumed and produced than the sizes of stuff we gave it
         // so use actual processed sizes here instead of our lengths from above
@@ -286,7 +280,7 @@ impl ResampledBufferedCircularProducer {
         self.consumer.finish_read(consumed);
         self.resampled_producer.finish_write(need_to_write_outputs, produced);
 
-        self.total_input_samples_remaining -= consumed as u128;
+        self.total_input_frames_remaining -= (consumed / self.channels) as u128;
         Ok((consumed, produced))
     }
 }
@@ -410,7 +404,7 @@ impl StreamAlignerProducer {
 
             let metadata = AudioBufferMetadata::Arrive(
                 // num available frames
-                appended_count as u64,
+                appended_frames as u64,
                 // estimated timestamp after this sample
                 micros_when_chunk_ended,
                 // target emitted frames
@@ -535,20 +529,21 @@ impl StreamAlignerResampler {
                     // which is slightly distinct from system_micros_after_packet_finishes
                     // because resampling may operate at some latency
                     let (consumed, produced) = self.handle_metadata(num_available_frames, target_emitted_frames, calibrated)?;
-                    self.total_processed_input_frames += consumed as u128;
-                    let micros_earlier = if consumed as u128 > num_leftovers_from_prev {
-                        let num_of_ours_consumed = (consumed as i128) - (num_leftovers_from_prev as i128);
+                    let consumed_frames = consumed / self.channels;
+                    self.total_processed_input_frames += consumed_frames as u128;
+                    let micros_earlier = if consumed_frames as u128 > num_leftovers_from_prev {
+                        let num_of_ours_consumed = (consumed_frames as i128) - (num_leftovers_from_prev as i128);
                         let num_of_ours_leftover = (num_available_frames as i128) - (num_of_ours_consumed as i128);
                         frames_to_micros(num_of_ours_leftover as u128, self.input_sample_rate as u128) as i128
                     } else {
                         // none of ours was consumed, skip back even further
-                        let additional_frames_back = (num_leftovers_from_prev as u128) - (consumed as u128);
+                        let additional_frames_back = (num_leftovers_from_prev as u128) - (consumed_frames as u128);
                         frames_to_micros(num_available_frames as u128 + additional_frames_back, self.input_sample_rate as u128) as i128
                     };
                     // will always be positive because it's relative to 1970
                     let system_micros_after_resampled_packet_finishes = (system_micros_after_packet_finishes as i128) - micros_earlier;
-                    let system_micros_at_start_of_packet = (system_micros_after_resampled_packet_finishes as u128) - frames_to_micros(consumed as u128, self.input_sample_rate as u128);
-                    self.finished_resampling_producer.send(ResamplingMetadata::Arrive(produced, system_micros_at_start_of_packet, system_micros_after_resampled_packet_finishes as u128, calibrated))?;
+                    let system_micros_at_start_of_packet = (system_micros_after_resampled_packet_finishes as u128) - frames_to_micros(consumed_frames as u128, self.input_sample_rate as u128);
+                    self.finished_resampling_producer.send(ResamplingMetadata::Arrive(produced / self.channels, system_micros_at_start_of_packet, system_micros_after_resampled_packet_finishes as u128, calibrated))?;
                     Ok(true)
                 },
                 AudioBufferMetadata::Teardown() => {
@@ -886,7 +881,7 @@ impl OutputStreamAlignerMixer {
             // this doesn't work because it'll stall for very large audio
             // resample_producer.resample_all()?; // do resampling of any available data
             // instead, do it streaming
-            resample_producer.resample((target_input_samples as u32) * (*channels as u32) * 2); // do * 2 so we also grab some leftovers if there are some, this is an upper bound
+            resample_producer.resample((target_input_samples as u32) * 2); // do * 2 so we also grab some leftovers if there are some, this is an upper bound
             let buf_from_stream = resample_consumer.get_chunk_to_read(round_to_channels(actual_input_chunk_size as u32, *channels) as usize);
             let frames = (buf_from_stream.len() / *channels as usize).min(frames_cap);
             if frames == 0 {
@@ -1864,16 +1859,18 @@ where
             }
             // in case we don't have enough data yet
             //data.fill(T::from_sample(0.0f32));
-            while device_audio_channel_consumer.available() < frames {
+            while device_audio_channel_consumer.available() < frames* mixer.channels {
                 mixer.mix_audio_streams(mixer.frame_size as usize);
             }
-            let chunk = device_audio_channel_consumer.get_chunk_to_read(frames);
+            let chunk = device_audio_channel_consumer.get_chunk_to_read(frames * mixer.channels);
             
             if chunk.is_empty() {
                 return;
             }
 
-            let samples_to_write = chunk.len().min(frames);
+            let chunk_frames = chunk.len() / mixer.channels;
+
+            let samples_to_write = chunk_frames*mixer.channels;
 
             // it arrives already interleaved, so we can just copy
             for (dst, &src) in data
