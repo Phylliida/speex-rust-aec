@@ -36,6 +36,7 @@ use std::{
 
 use std::backtrace::Backtrace;
 
+use rustfft::{FftPlanner, num_complex::Complex};
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -51,7 +52,6 @@ use speex_rust_aec::{
     speex_echo_cancellation, EchoCanceller, Resampler,
 };
 use std::f32::consts::PI;
-use rustfft::{FftPlanner};
 use rustfft::num_complex::Complex32;
 
 use std::time::{UNIX_EPOCH, SystemTime};
@@ -105,13 +105,38 @@ fn generate_probe_tone_16k_with_freqs(duration_ms: f32, freqs: &[f32]) -> Vec<f3
 
 /// Convenience: derive a distinct probe for each device index by nudging the frequencies.
 /// Keeps tones in the 1–3.5 kHz band (works at typical 16–48 kHz sample rates).
-fn generate_probe_tone_for_device(device_index: usize, duration_ms: f32, sample_rate: f32) -> Vec<f32> {
-    let base = [1_000.0f32, 1_800.0f32, 2_600.0f32];
+fn generate_probe_tone_for_device(device_index: usize, duration_ms: f32, sample_rate: u32) -> Vec<f32> {
+    //let base = [1_000.0f32, 1_800.0f32, 2_600.0f32];
     // Small offset per device to make correlation peaks separable.
-    let offset = (device_index as f32 % 5.0) * 120.0;
-    let freqs: Vec<f32> = base.iter().map(|f| f + offset).collect();
-    generate_probe_tone_with_freqs(duration_ms, sample_rate, &freqs)
+    //let offset = (device_index as f32 % 5.0) * 120.0;
+    //let freqs: Vec<f32> = base.iter().map(|f| f + offset).collect();
+    //generate_probe_tone_with_freqs(duration_ms, sample_rate, &freqs);
+    //let tone = chirp(1_200.0, 6_500.0, sample_rate, duration_ms);
+    indexed_chirp(device_index as u32, sample_rate, duration_ms / 1000.0)
 }
+
+fn indexed_chirp(idx: u32, sr: u32, dur_s: f32) -> Vec<f32> {
+    if dur_s <= 0.0 { return Vec::new(); }
+
+    let n = (dur_s * (sr as f32)).round().max(1.0) as usize;
+
+    // Derive a stable “seed” from idx to pick a band in 1–7 kHz (safe for 16 kHz+ sr).
+    let h = (idx.wrapping_mul(0x9E3779B9) ^ 0x85EBCA6B) as f32;
+    let base = 1_000.0 + (h.fract() * 800.0); // 1.0–1.8 kHz
+    let span = 4_500.0 + (h.sin().abs() * 1_500.0); // add 4.5–6.0 kHz
+    let f0 = base.min((sr as f32) * 0.45);
+    let f1 = (base + span).min((sr as f32) * 0.45);
+
+    // Log sweep: phase(t) = 2π f0 * (exp(k t) - 1) / k, where k = ln(f1/f0)/T
+    let k = (f1 / f0).ln() / dur_s;
+    (0..n).map(|i| {
+        let t = i as f32 / sr as f32;
+        let phase = 2.0 * PI * f0 * ((k * t).exp() - 1.0) / k;
+        let w = 0.5 * (1.0 - (2.0 * PI * i as f32 / (n as f32)).cos()); // Hann
+        (phase.sin() * w * 0.1) // 0.4 to keep headroom
+    }).collect()
+}
+
 
 /// Generate a short, Hann-windowed multi-tone probe at arbitrary sample rate.
 /// Pass distinct frequency sets per device to keep probes identifiable.
@@ -134,9 +159,26 @@ fn generate_probe_tone_with_freqs(duration_ms: f32, sample_rate: f32, freqs: &[f
     buf
 }
 
+fn hann(n: usize, i: usize) -> f32 {
+    0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (n as f32)).cos())
+}
+
+fn chirp(f0: f32, f1: f32, sr: f32, dur_s: f32) -> Vec<f32> {
+    let n = (dur_s * sr) as usize;
+    let k = (f1 / f0).ln() / dur_s; // log sweep rate
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / sr;
+            let phase = 2.0 * std::f32::consts::PI * f0 * ( (k * t).exp() - 1.0 ) / k;
+            (phase).sin() * hann(n, i)
+        })
+        .collect()
+}
+
+
 /// Probe detection using GCC-PHAT to estimate lag between the captured stream and each probe.
 /// Returns best (device_index, start_sample, score) per device that produced a valid match.
-fn detect_probe_tones(input_mono: &[f32], num_devices: usize, duration_ms: f32, sample_rate: f32) -> Vec<(usize, i64, f32)> {
+fn detect_probe_tones(input_mono: &[f32], num_devices: usize, duration_ms: f32, sample_rate: u32) -> Vec<(usize, i64, f32)> {
     let mut results = Vec::new();
     if num_devices == 0 || input_mono.is_empty() {
         return results;
@@ -151,11 +193,10 @@ fn detect_probe_tones(input_mono: &[f32], num_devices: usize, duration_ms: f32, 
         let mut probe_padded = vec![0.0f32; input_mono.len()];
         probe_padded[..probe.len()].copy_from_slice(&probe);
         let margin = input_mono.len().saturating_sub(1);
-        if let Some((lag, score)) = gcc_phat_delay(&input_mono, &probe_padded, margin) {
-            // positive lag means probe leads capture; convert to start index in capture
-            println!("Got lag {lag} {score}");
-            results.push((device, -lag, score));
-        }
+        let lag = gcc_phat_delay(&input_mono, &probe_padded);
+            // positive lag means probe leads capture; lag is the start index in the capture
+        println!("Got lag {lag}");
+        results.push((device, lag as i64, 0.0));
     }
     results
 }
@@ -221,22 +262,76 @@ fn detect_probe_fft(input: &[f32], probe: &[f32]) -> Option<(usize, f32)> {
     }
     best
 }
+fn normalize(x: &[f32]) -> Vec<f32> {
+    let peak = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    if peak == 0.0 { return x.to_vec(); }
+    let gain = 1.0 / peak;
+    x.iter().map(|&v| v * gain).collect()
+}
+/// Estimates delay (in samples) between x and y using GCC‑PHAT.
+/// Assumes x.len() == y.len() and power-of-two length for simplicity.
+fn gcc_phat_delay(x_in: &[f32], y_in: &[f32]) -> isize {
+    let x = normalize(x_in);
+    let y = normalize(y_in);
+    let n = x.len();
+    // Prepare complex buffers
+    let mut X: Vec<Complex<f32>> = x.iter().map(|&v| Complex::new(v, 0.0)).collect();
+    let mut Y: Vec<Complex<f32>> = y.iter().map(|&v| Complex::new(v, 0.0)).collect();
+
+    // Forward FFT
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(n);
+    fft.process(&mut X);
+    fft.process(&mut Y);
+
+    // Cross-spectrum with PHAT weighting: G = X * conj(Y); Psi = G / |G|
+    let mut psi: Vec<Complex<f32>> = X.iter().zip(Y.iter()).map(|(&xk, &yk)| {
+        let g = xk * yk.conj();
+        let mag = (g.re * g.re + g.im * g.im).sqrt();
+        if mag > 1e-12 { g / mag } else { Complex::new(0.0, 0.0) }
+    }).collect();
+
+    // Inverse FFT to get correlation-like function
+    let ifft = planner.plan_fft_inverse(n);
+    ifft.process(&mut psi);
+
+    // Take the peak: unwrap indices so delays near end map to negative lags
+    let mut max_idx = 0;
+    let mut max_val = psi[0].re;
+    for (i, v) in psi.iter().enumerate() {
+        if v.re > max_val {
+            max_val = v.re;
+            max_idx = i;
+        }
+    }
+    let half = n / 2;
+    if max_idx > half {
+        (max_idx as isize) - n as isize // negative lag
+    } else {
+        max_idx as isize                 // positive/zero lag
+    }
+}
 
 /// GCC-PHAT delay estimator between two real signals.
 /// Returns (lag_in_samples, score), where positive lag means `sigb` leads `siga`.
-fn gcc_phat_delay(siga: &[f32], sigb: &[f32], margin: usize) -> Option<(i64, f32)> {
-    let n = siga.len().min(sigb.len());
-    if n == 0 {
+fn gcc_phat_delay_old(siga: &[f32], sigb: &[f32], margin: usize) -> Option<(i64, f32)> {
+
+    let len_a = siga.len();
+    let len_b = sigb.len();
+    if len_a == 0 || len_b == 0 {
         return None;
     }
-    let n_fft = n.next_power_of_two().max(1);
+
+    // Pad to the linear convolution length to avoid circular wrap-around.
+    let conv_len = len_a + len_b - 1;
+    let n_fft = conv_len.next_power_of_two().max(1);
 
     let mut a: Vec<Complex32> = vec![Complex32::ZERO; n_fft];
     let mut b: Vec<Complex32> = vec![Complex32::ZERO; n_fft];
-    for (i, &v) in siga.iter().take(n).enumerate() {
+    for (i, &v) in siga.iter().enumerate() {
         a[i].re = v;
     }
-    for (i, &v) in sigb.iter().take(n).enumerate() {
+    for (i, &v) in sigb.iter().enumerate() {
         b[i].re = v;
     }
 
@@ -267,7 +362,9 @@ fn gcc_phat_delay(siga: &[f32], sigb: &[f32], margin: usize) -> Option<(i64, f32
     }
 
     let center = mid;
-    let max_margin = center.min(n_fft - center - 1);
+    // Valid lags for linear correlation are roughly ±(max(len_a, len_b) - 1).
+    let max_valid_lag = len_a.max(len_b).saturating_sub(1);
+    let max_margin = center.min(n_fft.saturating_sub(center + 1)).min(max_valid_lag);
     let m = margin.min(max_margin);
     let start = center.saturating_sub(m);
     let end = (center + m + 1).min(n_fft);
@@ -277,6 +374,7 @@ fn gcc_phat_delay(siga: &[f32], sigb: &[f32], margin: usize) -> Option<(i64, f32
         .enumerate()
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))?;
     let lag = (start + rel_idx) as i64 - center as i64;
+    println!("lag {lag} start {start} rel_idx {rel_idx} center {center}");
     Some((lag, best_val))
 }
 
@@ -1604,8 +1702,14 @@ impl AecStream {
         Ok(())
     }
 
-    fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(Vec<usize, Option<i64>>, Vec<usize, Vec<usize, Option<i64>>>), Box<dyn std::error::Error>> {
-        let sample_rate = self.aec_config.target_sample_rate as f32;
+    fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) {
+        let calibration_offsets = self.get_calibration_offsets(output_producers, debug_wav);
+
+        
+    }
+
+    fn get_calibration_offsets(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(Vec<Option<i64>>, Vec<Vec<Option<i64>>>), Box<dyn std::error::Error>> {
+        let sample_rate = self.aec_config.target_sample_rate as u32;
         // Probe length (~0.1s) to stay quick but audible.
         let tone_ms = 100.0;
         let capture_secs = 3.0;
@@ -1756,9 +1860,9 @@ impl AecStream {
 
         // 4) Detect probes on outputs to compute offsets relative to output device 0.
         // mapping of output device -> offset
-        let mut output_offsets: Vec<Option<i64>> = vec![None, output_channel_ranges.len()];
+        let mut output_offsets: Vec<Option<i64>> = vec![None; output_channel_ranges.len()];
         // mapping of input device -> (output device index, output device index offset)
-        let mut input_offsets: Vec<usize, Vec<usize, Option<i64>>> = vec![vec![None; output_channel_ranges.len()], input_channel_ranges.len()];
+        let mut input_offsets: Vec<Vec<Option<i64>>> = vec![vec![None; output_channel_ranges.len()]; input_channel_ranges.len()];
 
         if !captured_outputs.is_empty() {
             for (dev_idx, buf) in captured_outputs.iter().enumerate() {
@@ -1771,8 +1875,9 @@ impl AecStream {
                     }
                 }
                 if let Some((start, score)) = start_for_dev {
-                    println!("Output {dev_idx} has offset {start} with score {score}");
-                    output_offsets[dev_idx] = start;
+                    let in_seconds = (start as f32) / (sample_rate as f32);
+                    println!("Output {dev_idx} has offset {start} {in_seconds} with score {score}");
+                    output_offsets[dev_idx] = Some(start);
                 } else {
                     eprintln!("No probe detected for output device index {dev_idx}");
                 }
@@ -1781,7 +1886,8 @@ impl AecStream {
                 let detections = detect_probe_tones(buf, output_producers.len(), tone_ms, sample_rate);
                 let mut start_for_dev: Option<(i64, f32)> = None;
                 for (output_idx, start, score) in detections {
-                    println!("Output {output_idx} -> Input {input_idx} has offset {start} with score {score}");
+                    let in_seconds = (start as f32) / (sample_rate as f32);
+                    println!("Output {output_idx} -> Input {input_idx} has offset {start} {in_seconds} with score {score}");
                     input_offsets[input_idx][output_idx] = Some(start);
                 }
                 for output_idx in 0..output_channel_ranges.len() {
@@ -2305,8 +2411,10 @@ where
             }
             // in case we don't have enough data yet
             //data.fill(T::from_sample(0.0f32));
-            while device_audio_channel_consumer.available() < frames* mixer.channels {
-                mixer.mix_audio_streams(mixer.frame_size as usize);
+            let mut frames_needed = frames as i64 - (device_audio_channel_consumer.available() / mixer.channels) as i64;
+            while frames_needed > 0 {
+                mixer.mix_audio_streams(frames_needed as usize + 1000); // a few extra in case of resampling
+                frames_needed = frames as i64 - (device_audio_channel_consumer.available() / mixer.channels) as i64;
             }
             let chunk = device_audio_channel_consumer.get_chunk_to_read(frames * mixer.channels);
             
