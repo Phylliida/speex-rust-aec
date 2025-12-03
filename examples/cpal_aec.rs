@@ -117,23 +117,22 @@ fn generate_probe_tone_for_device(device_index: usize, duration_ms: f32, sample_
 
 fn indexed_chirp(idx: u32, sr: u32, dur_s: f32) -> Vec<f32> {
     if dur_s <= 0.0 { return Vec::new(); }
+    let sr = sr as f32;
+    let n = (dur_s * sr).round().max(1.0) as usize;
 
-    let n = (dur_s * (sr as f32)).round().max(1.0) as usize;
-
-    // Derive a stable “seed” from idx to pick a band in 1–7 kHz (safe for 16 kHz+ sr).
     let h = (idx.wrapping_mul(0x9E3779B9) ^ 0x85EBCA6B) as f32;
-    let base = 1_000.0 + (h.fract() * 800.0); // 1.0–1.8 kHz
-    let span = 4_500.0 + (h.sin().abs() * 1_500.0); // add 4.5–6.0 kHz
-    let f0 = base.min((sr as f32) * 0.45);
-    let f1 = (base + span).min((sr as f32) * 0.45);
+    let base = 150.0 + (h.fract() * 120.0);       // ~150–270 Hz
+    let span = 500.0 + (h.sin().abs() * 300.0);   // +0.5–0.8 kHz
+    let nyq_limit = sr * 0.2;                     // keep it low
+    let f0 = base.min(nyq_limit);
+    let f1 = (base + span).min(nyq_limit);
 
-    // Log sweep: phase(t) = 2π f0 * (exp(k t) - 1) / k, where k = ln(f1/f0)/T
     let k = (f1 / f0).ln() / dur_s;
     (0..n).map(|i| {
-        let t = i as f32 / sr as f32;
-        let phase = 2.0 * PI * f0 * ((k * t).exp() - 1.0) / k;
-        let w = 0.5 * (1.0 - (2.0 * PI * i as f32 / (n as f32)).cos()); // Hann
-        (phase.sin() * w * 0.1) // 0.4 to keep headroom
+        let t = i as f32 / sr;
+        let phase = 2.0 * std::f32::consts::PI * f0 * ((k * t).exp() - 1.0) / k;
+        let w = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos()); // Hann
+        (phase.sin() * w * 0.3) // adjust gain as needed
     }).collect()
 }
 
@@ -1702,10 +1701,34 @@ impl AecStream {
         Ok(())
     }
 
-    fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) {
-        let calibration_offsets = self.get_calibration_offsets(output_producers, debug_wav);
-
-        
+    fn calibrate(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let (output_offsets, input_offsets) = self.get_calibration_offsets(output_producers, debug_wav)?;
+        // we need to throw away some samples for each device until we are calibrated
+        // each device will have an offset (could be negative)
+        for input_index in 0..input_offsets.len() {
+            let mut shifts_needed = Vec::new();
+            for output_index in 0..output_offsets.len() {
+                if let Some(output_offset) = output_offsets[output_index] {
+                    if let Some(input_offset) = input_offsets[input_index][output_index] {
+                        let shift_needed = input_offset - output_offset;
+                        shifts_needed.push(shift_needed);
+                    }
+                }
+            }
+            // take the min of the shift needed for each device (we don't ever want it to occur before the device)
+            let shift_needed = if let Some(min_val) = shifts_needed.iter().min() {
+                *min_val    
+            } else {
+                0
+            };
+            if let Some(aligner) = self.input_aligners.get_mut(&self.sorted_input_aligners[input_index].clone()) {
+                // skip ahead that many samples (* num channels bc it is multi channel)
+                let (ok, chunk) = aligner.get_chunk_to_read((shift_needed as usize) * aligner.channels);
+                let chunk_len = chunk.len();
+                aligner.finish_read(chunk_len);
+            }
+        }
+        Ok(())
     }
 
     fn get_calibration_offsets(&mut self, output_producers: &mut [OutputStreamAlignerProducer], debug_wav: bool) -> Result<(Vec<Option<i64>>, Vec<Vec<Option<i64>>>), Box<dyn std::error::Error>> {
@@ -2565,7 +2588,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!("Computing calibration");
-    let _offsets = stream.calibrate(std::slice::from_mut(&mut stream_output_creator), true)?;
+    stream.calibrate(std::slice::from_mut(&mut stream_output_creator), true)?;
     println!("calibrated");
 
     // enqueues audio samples to be played after each other
