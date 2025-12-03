@@ -1717,7 +1717,7 @@ impl AecStream {
             }
             // take the min of the shift needed for each device (we don't ever want it to occur before the device)
             let shift_needed = if let Some(min_val) = shifts_needed.iter().min() {
-                *min_val    
+                (*min_val as i64-(self.aec_config.frame_size/2) as i64).max(0)
             } else {
                 0
             };
